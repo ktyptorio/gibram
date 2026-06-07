@@ -281,6 +281,7 @@ func (s *Server) Start(addr string) error {
 	logging.Info("  Max frame size: %d bytes", s.maxFrameSize)
 	logging.Info("  Rate limit: %d req/s (burst: %d)", s.rateLimit, s.rateBurst)
 
+	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
 }
@@ -297,6 +298,8 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) acceptLoop() {
+	defer s.wg.Done()
+
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
