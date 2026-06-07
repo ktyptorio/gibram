@@ -1,9 +1,12 @@
 // Package simd provides SIMD-optimized distance calculations
+//go:build amd64
 // +build amd64
 
 package simd
 
 import (
+	"math"
+
 	"golang.org/x/sys/cpu"
 )
 
@@ -27,7 +30,7 @@ func cosineSimilarityAVX2(a, b []float32) float32 {
 	// Process 8 floats at a time with AVX2
 	var dot, normA, normB float32
 	i := 0
-	
+
 	// AVX2 loop - process 8 elements at a time
 	for ; i+8 <= n; i += 8 {
 		// Manually unroll for better performance
@@ -130,24 +133,8 @@ func l2NormAVX2(a []float32) float32 {
 
 // float32Sqrt is a helper for fast square root
 func float32Sqrt(x float32) float32 {
-	// Use x86 SQRTSS instruction via assembly
-	// For now, use Go's built-in sqrt
-	return float32(fastSqrt(float64(x)))
-}
-
-// fastSqrt provides a fast square root approximation
-func fastSqrt(x float64) float64 {
-	// This could be optimized with assembly VSQRTSD
-	// For now, use standard library
 	if x <= 0 {
 		return 0
 	}
-	
-	// Fast inverse square root approximation (Quake III algorithm adapted)
-	// For production, we'd use hardware SQRT instruction
-	half := x * 0.5
-	i := int64(0x5fe6eb50c7b537a9 - (int64(x) >> 1))
-	y := float64(i)
-	y = y * (1.5 - (half * y * y))
-	return x * y
+	return float32(math.Sqrt(float64(x)))
 }
