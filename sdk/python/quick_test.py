@@ -12,7 +12,7 @@ import sys
 
 def main():
     print("=" * 60)
-    print("GibRAM Python SDK v0.2.0 - Quick Test")
+    print("GibRAM Python SDK v0.3.0 - Quick Test")
     print("=" * 60 + "\n")
 
     # Check API key

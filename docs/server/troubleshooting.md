@@ -1,4 +1,4 @@
-# Troubleshooting (v0.2.0)
+# Troubleshooting (v0.3.0)
 
 Common issues and solutions when running GibRAM server.
 

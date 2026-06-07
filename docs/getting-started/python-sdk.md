@@ -1,4 +1,4 @@
-# Use Python SDK (v0.2.0)
+# Use Python SDK (v0.3.0)
 
 Get from zero to working GraphRAG in 5 minutes. The SDK handles chunking, extraction, embedding, and storage automatically.
 

@@ -1,4 +1,4 @@
-# GibRAM Python SDK v0.2.0
+# GibRAM Python SDK v0.3.0
 
 GraphRAG-style knowledge graph indexing with automatic entity extraction, relationship detection, and community discovery.
 
@@ -272,5 +272,5 @@ MIT
 
 ## Version
 
-v0.2.0 - Current release
+v0.3.0 - Current release
 v0.1.0 - Initial release with OpenAI extraction & embeddings

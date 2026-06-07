@@ -1,6 +1,8 @@
 # Multi-stage build for minimal image size
 FROM golang:1.24-alpine AS builder
 
+ARG VERSION=dev
+
 WORKDIR /build
 
 # Install build dependencies
@@ -15,7 +17,7 @@ COPY . .
 
 # Build binary (static linking)
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.Version=${VERSION:-dev}" \
+    -ldflags="-s -w -X main.Version=${VERSION}" \
     -o gibram-server ./cmd/server
 
 # Final stage - minimal Alpine image

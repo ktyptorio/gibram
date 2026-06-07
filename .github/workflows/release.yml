@@ -87,6 +87,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Extract server version
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#server/}"
+          version="${version#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       
       - name: Download all artifacts
         uses: actions/download-artifact@v4

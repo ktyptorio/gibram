@@ -7,6 +7,17 @@ server:
   data_dir: "./data"
   vector_dim: 1536
 
+session_store:
+  # Default for exploration and fast RAG workflows.
+  # Set to "durable" explicitly for restart/crash recovery.
+  mode: "ephemeral"
+  wal_dir: "./data/session_wal"
+  wal_sync_policy: "every_write" # every_write, periodic, never
+  wal_sync_interval: 1s
+  snapshot_dir: "./data/session_snapshots"
+  snapshot_interval: 5m
+  snapshot_wal_size_bytes: 67108864
+
 tls:
   # PRODUCTION: Use custom certificates (recommended)
   # Generate with: openssl req -x509 -newkey rsa:4096 -nodes \

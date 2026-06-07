@@ -1,12 +1,12 @@
 # GibRAM
 
-**Graph in-Buffer Retrieval & Associative Memory** • **v0.2.0**
+**Graph in-Buffer Retrieval & Associative Memory** • **v0.3.0**
 
 GibRAM is an in-memory knowledge graph server designed for retrieval augmented generation (RAG) workflows. It combines graph storage with vector search so related information stays connected in memory.
 
 ## What is GibRAM?
 
-- **In-Memory & Ephemeral**: Data lives in RAM with configurable time-to-live. Built for short-lived analysis, not persistent storage.
+- **Session-Based with Optional Durability**: Ephemeral mode stays optimized for exploration, while durable mode adds WAL, snapshots, and restart recovery for explicit production deployments.
 - **Graph + Vectors Together**: Stores entities, relationships, and document chunks alongside their embeddings in a unified structure.
 - **Graph-Aware Retrieval**: Supports both semantic search and graph traversal, retrieving context that pure vector search might miss.
 - **Python SDK**: GraphRAG-style workflow for indexing documents and querying with minimal code.

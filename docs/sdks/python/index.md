@@ -1,4 +1,4 @@
-# Python SDK (v0.2.0)
+# Python SDK (v0.3.0)
 
 The GibRAM Python SDK provides a GraphRAG-style workflow for indexing documents and querying knowledge graphs with minimal code.
 

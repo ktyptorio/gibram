@@ -9,5 +9,5 @@ import (
 //go:embed version.txt
 var rawVersion string
 
-// Version is the trimmed semantic version (e.g., "0.2.0").
+// Version is the trimmed semantic version (e.g., "0.3.0").
 var Version = strings.TrimSpace(rawVersion)

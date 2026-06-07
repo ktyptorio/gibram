@@ -1,4 +1,4 @@
-"""Integration test for GibRAM Python SDK v0.2.0."""
+"""Integration test for GibRAM Python SDK v0.3.0."""
 
 import os
 import sys
@@ -235,7 +235,7 @@ def test_query_modes():
 def main():
     """Run all integration tests."""
     print("=" * 60)
-    print("GibRAM Python SDK v0.2.0 Integration Tests")
+    print("GibRAM Python SDK v0.3.0 Integration Tests")
     print("=" * 60 + "\n")
 
     # Check environment

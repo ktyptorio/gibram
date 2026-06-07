@@ -57,6 +57,7 @@ nav:
       - Use Python SDK: getting-started/python-sdk.md
   - Server:
       - Configuration Basics: server/configuration-basics.md
+      - Durable Session Store: server/durable-session-store.md
       - Troubleshooting: server/troubleshooting.md
   - SDKs:
       - Python:

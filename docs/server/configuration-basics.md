@@ -1,4 +1,4 @@
-# Configuration Basics (v0.2.0)
+# Configuration Basics (v0.3.0)
 
 Configure GibRAM server for production: TLS, authentication, persistence, and resource limits.
 

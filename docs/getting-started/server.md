@@ -1,4 +1,4 @@
-# Run GibRAM Server (v0.2.0)
+# Run GibRAM Server (v0.3.0)
 
 Get GibRAM server running on your machine. This guide covers the fastest path to a working server.
 
@@ -34,15 +34,33 @@ docker run -d \
   gibramio/gibram:latest
 ```
 
-For persistent data:
+For restart/crash recovery, explicitly enable Durable Session Store in `config.yaml`:
+
+```yaml
+server:
+  data_dir: "/var/lib/gibram/data"
+
+session_store:
+  mode: "durable"
+  wal_dir: "/var/lib/gibram/data/session_wal"
+  wal_sync_policy: "every_write"
+  snapshot_dir: "/var/lib/gibram/data/session_snapshots"
+  snapshot_interval: 5m
+  snapshot_wal_size_bytes: 67108864
+```
+
+Mount that configuration and a persistent volume:
 
 ```bash
 docker run -d \
   -p 6161:6161 \
+  -v ./config.yaml:/etc/gibram/config.yaml:ro \
   -v gibram-data:/var/lib/gibram/data \
   --name gibram \
   gibramio/gibram:latest
 ```
+
+See [Durable Session Store](../server/durable-session-store.md) for RPO/RTO, recovery, snapshot, and failure-mode guidance.
 
 ### Option 3: Build from Source
 
@@ -68,7 +86,7 @@ gibram-server --insecure
 Expected output:
 
 ```
-INFO  GibRAM v0.2.0 starting...
+INFO  GibRAM v0.3.0 starting...
 INFO    Address:    :6161
 INFO    Data dir:   ./data
 INFO    Vector dim: 1536

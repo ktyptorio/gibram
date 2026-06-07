@@ -48,6 +48,7 @@ sdk/
 # Temporary files
 tmp/
 temp/
+outputs/
 
 # Docker files
 Dockerfile

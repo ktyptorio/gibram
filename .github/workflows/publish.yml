@@ -28,9 +28,14 @@ jobs:
         tag="${GITHUB_REF_NAME}"
         version="${tag#sdk-python/}"
         version="${version#v}"
-        code_version=$(cat pkg/version/version.txt | tr -d '\n')
-        if [ "$code_version" != "$version" ]; then
-          echo "Tag version does not match version file: tag=$version file=$code_version"
+        server_version=$(cat pkg/version/version.txt | tr -d '\n')
+        sdk_version=$(python -c "exec(open('sdk/python/gibram/_version.py').read()); print(__version__)")
+        if [ "$server_version" != "$version" ]; then
+          echo "Tag version does not match server version file: tag=$version file=$server_version"
+          exit 1
+        fi
+        if [ "$sdk_version" != "$version" ]; then
+          echo "Tag version does not match Python SDK version: tag=$version sdk=$sdk_version"
           exit 1
         fi
     

@@ -1,7 +1,7 @@
 """GibRAM protobuf protocol encoder/decoder."""
 
 import struct
-from typing import Tuple, Optional, Any, Dict
+from typing import Tuple, Any, Dict
 from enum import IntEnum
 from .proto import gibram_pb2 as pb
 from .exceptions import ProtocolError
@@ -16,7 +16,7 @@ class CodecType(IntEnum):
 class _Protocol:
     """
     Protobuf protocol encoder/decoder for GibRAM.
-    
+
     Wire format: [codec: 1 byte][length: 4 bytes BE][protobuf envelope]
     """
 
@@ -210,9 +210,7 @@ class _Protocol:
     @staticmethod
     def encode_query(query_vector: list, search_types: list, top_k: int) -> bytes:
         """Encode QUERY request."""
-        req = pb.QueryRequest(
-            query_vector=query_vector, search_types=search_types, top_k=top_k
-        )
+        req = pb.QueryRequest(query_vector=query_vector, search_types=search_types, top_k=top_k)
         return req.SerializeToString()
 
     @staticmethod
@@ -277,10 +275,14 @@ class _Protocol:
             )
 
         return {
+            "query_id": resp.query_id,
             "entities": entities,
             "textunits": text_units,
             "communities": communities,
             "execution_time_ms": resp.stats.duration_micros / 1000.0 if resp.stats else 0.0,
+            "vector_searches": resp.stats.vector_searches if resp.stats else 0,
+            "graph_traversals": resp.stats.graph_traversals if resp.stats else 0,
+            "skipped_seed_indexes": (list(resp.stats.skipped_seed_indexes) if resp.stats else []),
         }
 
     @staticmethod
@@ -355,4 +357,7 @@ class _Protocol:
             "community_count": resp.community_count,
             "vector_dim": resp.vector_dim,
             "session_count": resp.session_count,
+            "session_store_mode": resp.session_store_mode,
+            "wal_sync_policy": resp.wal_sync_policy,
+            "wal_sync_interval_ms": resp.wal_sync_interval_ms,
         }
