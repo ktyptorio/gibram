@@ -3,6 +3,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"math/rand"
 	"sync"
 	"testing"
@@ -410,7 +411,9 @@ func TestScenario_ConcurrentMultiUser(t *testing.T) {
 				spec := types.DefaultQuerySpec()
 				spec.QueryVector = randomVector(testVectorDim)
 				if _, err := e.Query(testSessionID, spec); err != nil {
-					errCh <- err
+					if !errors.Is(err, ErrRetrievalNotReady) {
+						errCh <- err
+					}
 				}
 			}
 		}()
@@ -500,17 +503,72 @@ func TestEngine_RebuildVectorIndices(t *testing.T) {
 	// Add some data with vectors
 	embedding := randomVector(testVectorDim)
 	doc := mustAddDocument(t, e, testSessionID, "doc-1", "file.pdf")
-	mustAddTextUnit(t, e, testSessionID, "tu-1", doc.ID, "Content", embedding, 10)
-	mustAddEntity(t, e, testSessionID, "ent-1", "Entity", "test", "Desc", embedding)
-	mustAddCommunity(t, e, testSessionID, "comm-1", "Community", "Summary", "Full", 0, nil, nil, embedding)
+	tu := mustAddTextUnit(t, e, testSessionID, "tu-1", doc.ID, "Content", embedding, 10)
+	ent := mustAddEntity(t, e, testSessionID, "ent-1", "Entity", "test", "Desc", embedding)
+	ent2 := mustAddEntity(t, e, testSessionID, "ent-2", "Entity Two", "test", "Desc", embedding)
+	rel := mustAddRelationship(t, e, testSessionID, "rel-1", ent.ID, ent2.ID, "RELATED", "Desc", 1)
+	comm := mustAddCommunity(t, e, testSessionID, "comm-1", "Community", "Summary", "Full", 0, []uint64{ent.ID, ent2.ID}, []uint64{rel.ID}, embedding)
+
+	originalInfo, err := e.InfoForSession(testSessionID)
+	if err != nil {
+		t.Fatalf("InfoForSession before rebuild failed: %v", err)
+	}
 
 	// Rebuild indices
-	err := e.RebuildVectorIndices(testSessionID)
-	if err != nil {
+	if err := e.RebuildVectorIndices(testSessionID); err != nil {
 		t.Fatalf("RebuildVectorIndices failed: %v", err)
 	}
 
-	// Verify indices still work
+	rebuiltInfo, err := e.InfoForSession(testSessionID)
+	if err != nil {
+		t.Fatalf("InfoForSession after rebuild failed: %v", err)
+	}
+	if rebuiltInfo.DocumentCount != originalInfo.DocumentCount ||
+		rebuiltInfo.TextUnitCount != originalInfo.TextUnitCount ||
+		rebuiltInfo.EntityCount != originalInfo.EntityCount ||
+		rebuiltInfo.RelationshipCount != originalInfo.RelationshipCount ||
+		rebuiltInfo.CommunityCount != originalInfo.CommunityCount {
+		t.Fatalf("rebuild changed canonical counts: before=%+v after=%+v", originalInfo, rebuiltInfo)
+	}
+
+	if got, ok := e.GetDocument(testSessionID, doc.ID); !ok || got.ExternalID != doc.ExternalID {
+		t.Fatalf("document was not preserved after rebuild")
+	}
+	if got, ok := e.GetTextUnit(testSessionID, tu.ID); !ok || got.ExternalID != tu.ExternalID {
+		t.Fatalf("text unit was not preserved after rebuild")
+	}
+	if got, ok := e.GetEntity(testSessionID, ent.ID); !ok || got.ExternalID != ent.ExternalID {
+		t.Fatalf("entity was not preserved after rebuild")
+	}
+	if got, ok := e.GetRelationship(testSessionID, rel.ID); !ok || got.ExternalID != rel.ExternalID {
+		t.Fatalf("relationship was not preserved after rebuild")
+	}
+	if got, ok := e.GetCommunity(testSessionID, comm.ID); !ok || got.ExternalID != comm.ExternalID {
+		t.Fatalf("community was not preserved after rebuild")
+	}
+
+	nextDoc := mustAddDocument(t, e, testSessionID, "doc-2", "next.pdf")
+	if nextDoc.ID <= doc.ID {
+		t.Fatalf("document ID generator was reset by rebuild: previous=%d next=%d", doc.ID, nextDoc.ID)
+	}
+	nextTU := mustAddTextUnit(t, e, testSessionID, "tu-2", nextDoc.ID, "Next content", embedding, 10)
+	if nextTU.ID <= tu.ID {
+		t.Fatalf("text unit ID generator was reset by rebuild: previous=%d next=%d", tu.ID, nextTU.ID)
+	}
+	nextEnt := mustAddEntity(t, e, testSessionID, "ent-3", "Entity Three", "test", "Desc", embedding)
+	if nextEnt.ID <= ent2.ID {
+		t.Fatalf("entity ID generator was reset by rebuild: previous=%d next=%d", ent2.ID, nextEnt.ID)
+	}
+	nextRel := mustAddRelationship(t, e, testSessionID, "rel-2", nextEnt.ID, ent.ID, "RELATED", "Desc", 1)
+	if nextRel.ID <= rel.ID {
+		t.Fatalf("relationship ID generator was reset by rebuild: previous=%d next=%d", rel.ID, nextRel.ID)
+	}
+	nextComm := mustAddCommunity(t, e, testSessionID, "comm-2", "Community Two", "Summary", "Full", 0, nil, nil, embedding)
+	if nextComm.ID <= comm.ID {
+		t.Fatalf("community ID generator was reset by rebuild: previous=%d next=%d", comm.ID, nextComm.ID)
+	}
+
+	// Verify rebuilt indices still work.
 	spec := types.DefaultQuerySpec()
 	spec.QueryVector = embedding
 
@@ -521,6 +579,15 @@ func TestEngine_RebuildVectorIndices(t *testing.T) {
 
 	if result.QueryID == 0 {
 		t.Error("Should get valid query result after rebuild")
+	}
+	if len(result.TextUnits) == 0 {
+		t.Error("query after rebuild should return indexed text units")
+	}
+	if len(result.Entities) == 0 {
+		t.Error("query after rebuild should return indexed entities")
+	}
+	if len(result.Communities) == 0 {
+		t.Error("query after rebuild should return indexed communities")
 	}
 }
 

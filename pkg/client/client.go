@@ -655,6 +655,10 @@ func (c *Client) Info() (*types.ServerInfo, error) {
 		return nil, err
 	}
 
+	return serverInfoFromProto(&infoResp), nil
+}
+
+func serverInfoFromProto(infoResp *pb.InfoResponse) *types.ServerInfo {
 	return &types.ServerInfo{
 		Version:           infoResp.Version,
 		DocumentCount:     int(infoResp.DocumentCount),
@@ -663,7 +667,11 @@ func (c *Client) Info() (*types.ServerInfo, error) {
 		RelationshipCount: int(infoResp.RelationshipCount),
 		CommunityCount:    int(infoResp.CommunityCount),
 		VectorDim:         int(infoResp.VectorDim),
-	}, nil
+		SessionCount:      int(infoResp.SessionCount),
+		SessionStoreMode:  infoResp.SessionStoreMode,
+		WALSyncPolicy:     infoResp.WalSyncPolicy,
+		WALSyncIntervalMS: infoResp.WalSyncIntervalMs,
+	}
 }
 
 // HealthStatus represents server health information
@@ -1071,7 +1079,9 @@ func (c *Client) Query(spec types.QuerySpec) (*types.ContextPack, error) {
 	result := &types.ContextPack{
 		QueryID: queryResp.QueryId,
 		Stats: types.QueryStats{
-			DurationMicros: queryResp.Stats.DurationMicros,
+			DurationMicros:     queryResp.Stats.DurationMicros,
+			EdgesScanned:       int(queryResp.Stats.GraphTraversals),
+			SkippedSeedIndexes: queryResp.Stats.SkippedSeedIndexes,
 		},
 	}
 

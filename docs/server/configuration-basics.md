@@ -179,17 +179,29 @@ security:
 
 ## Persistence (Optional)
 
-**By Default**: GibRAM is ephemeral (in-memory only). Data lost on restart.
+**By Default**: GibRAM is ephemeral (in-memory only). Data is lost on restart.
 
-**Enable Persistence**:
+**Production Durable Mode**:
 
-Currently, WAL and snapshot are initialized but **manual operation only**. Commands available:
+```yaml
+session_store:
+  mode: "durable"
+  wal_dir: "/var/lib/gibram/data/session_wal"
+  wal_sync_policy: "every_write"
+  wal_sync_interval: 1s
+  snapshot_dir: "/var/lib/gibram/data/session_snapshots"
+  snapshot_interval: 5m
+  snapshot_wal_size_bytes: 67108864
+```
+
+Admin commands:
 
 - `SAVE` - Create snapshot (blocking)
 - `BGSAVE` - Create snapshot (background)
 - `LASTSAVE` - Get last save timestamp
+- `BGRESTORE` - Restore from a snapshot path under `server.data_dir`
 
-**Future**: Automatic persistence configuration.
+Automatic snapshots can be triggered by `snapshot_interval` or `snapshot_wal_size_bytes`. See [Durable Session Store Operations](durable-session-store.md) for WAL sync policy, backup/restore, failure modes, RPO/RTO expectations, and remediation steps.
 
 ## Session Management
 
@@ -271,10 +283,24 @@ tls:
 auth:
   keys:
     - id: "production-app"
-      key: "{{ .Env.GIBRAM_API_KEY }}"
+      key_hash: "$2a$12$replace_with_bcrypt_hash_for_production_app_key"
       permissions: ["write"]
 
+session_store:
+  mode: "durable"
+  wal_dir: "/var/lib/gibram/data/session_wal"
+  wal_sync_policy: "every_write"
+  snapshot_dir: "/var/lib/gibram/data/session_snapshots"
+  snapshot_interval: 5m
+  snapshot_wal_size_bytes: 67108864
+
 security:
+  max_frame_size: 4194304
+  max_content_bytes: 1048576
+  max_memory_bytes: 4294967296
+  max_session_documents: 1000000
+  max_session_entities: 1000000
+  max_session_relationships: 5000000
   rate_limit: 5000
   max_conns_per_ip: 100
 

@@ -57,6 +57,10 @@ func main() {
 		VectorDim: *vectorDim,
 		LogLevel:  *logLevel,
 	})
+	if err := cfg.NormalizeSessionStore(); err != nil {
+		logging.Error("Invalid session store config: %v", err)
+		os.Exit(1)
+	}
 
 	// Initialize logger from config
 	err = logging.Init(logging.Config{
@@ -81,6 +85,12 @@ func main() {
 	log.Info("  Address:    %s", cfg.Server.Addr)
 	log.Info("  Data dir:   %s", cfg.Server.DataDir)
 	log.Info("  Vector dim: %d", cfg.Server.VectorDim)
+	log.Info("  Store mode: %s", cfg.SessionStore.Mode)
+	if cfg.SessionStore.Mode == "durable" {
+		log.Info("  Session WAL: %s", cfg.SessionStore.WALDir)
+		log.Info("  WAL sync:    %s (%s)", cfg.SessionStore.WALSyncPolicy, cfg.SessionStore.WALSyncInterval)
+		log.Info("  Snapshots:   %s", cfg.SessionStore.SnapshotDir)
+	}
 	log.Info("  Log level:  %s", cfg.Logging.Level)
 	log.Info("  Protocol:   GibRAM Protocol v1 (proto3)")
 	if *insecure {
@@ -92,8 +102,32 @@ func main() {
 		cfg.TLS.AutoCert = false // Disable auto-cert
 	}
 
-	// Create engine (in-memory for now, can add persistence later)
-	eng := engine.NewEngine(cfg.Server.VectorDim)
+	eng, err := engine.NewEngineWithOptions(engine.Options{
+		VectorDim: cfg.Server.VectorDim,
+		StoreMode: cfg.SessionStore.Mode,
+		Durable: engine.DurableOptions{
+			WALDir:               cfg.SessionStore.WALDir,
+			SnapshotDir:          cfg.SessionStore.SnapshotDir,
+			SyncPolicy:           cfg.SessionStore.WALSyncPolicy,
+			SyncInterval:         cfg.SessionStore.WALSyncInterval,
+			SnapshotInterval:     cfg.SessionStore.SnapshotInterval,
+			SnapshotWALSizeBytes: cfg.SessionStore.SnapshotWALSizeBytes,
+		},
+		ResourceLimits: engine.ResourceLimits{
+			MaxDocuments:     cfg.Security.MaxSessionDocuments,
+			MaxEntities:      cfg.Security.MaxSessionEntities,
+			MaxRelationships: cfg.Security.MaxSessionRelationships,
+			MaxMemoryBytes:   cfg.Security.MaxMemoryBytes,
+		},
+	})
+	if err != nil {
+		if cfg.SessionStore.Mode == "durable" {
+			log.Error("Durable session recovery failed; refusing to start: %v", err)
+		} else {
+			log.Error("Failed to initialize engine: %v", err)
+		}
+		os.Exit(1)
+	}
 
 	// Start session cleanup goroutine
 	eng.StartSessionCleanup(*sessionCleanupInterval)
@@ -174,6 +208,15 @@ func main() {
 
 	// Setup snapshot callback - Production-grade implementation
 	srv.SetSnapshotCallback(func(path string) error {
+		if cfg.SessionStore.Mode == "durable" {
+			snapshotPath, err := eng.CreateDurableSnapshot(path, true)
+			if err != nil {
+				return err
+			}
+			log.Info("Durable snapshot completed: %s", snapshotPath)
+			return nil
+		}
+
 		if path == "" {
 			path = filepath.Join(snapshotDir, backup.GenerateSnapshotName("gibram"))
 		}
@@ -299,6 +342,10 @@ func main() {
 	shutdownHandler.Register("session-cleanup", 20, func(ctx context.Context) error {
 		eng.StopSessionCleanup()
 		return nil
+	})
+
+	shutdownHandler.Register("engine", 25, func(ctx context.Context) error {
+		return eng.Close()
 	})
 
 	shutdownHandler.Register("profiler", 30, func(ctx context.Context) error {

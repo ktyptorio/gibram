@@ -154,6 +154,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Logging.Output != "stdout" {
 		t.Errorf("expected log output stdout, got %s", cfg.Logging.Output)
 	}
+	if cfg.SessionStore.Mode != "ephemeral" {
+		t.Errorf("expected default session store mode ephemeral, got %s", cfg.SessionStore.Mode)
+	}
+	if cfg.SessionStore.WALSyncPolicy != "every_write" {
+		t.Errorf("expected default WAL sync policy every_write, got %s", cfg.SessionStore.WALSyncPolicy)
+	}
 }
 
 // =============================================================================
@@ -185,6 +191,12 @@ tls:
 logging:
   level: debug
   format: json
+session_store:
+  mode: durable
+  wal_sync_policy: periodic
+  wal_sync_interval: 250ms
+  snapshot_interval: 5s
+  snapshot_wal_size_bytes: 1048576
 `
 
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -210,6 +222,53 @@ logging:
 	}
 	if cfg.Logging.Format != "json" {
 		t.Errorf("expected log format json, got %s", cfg.Logging.Format)
+	}
+	if cfg.SessionStore.Mode != "durable" {
+		t.Errorf("expected session store mode durable, got %s", cfg.SessionStore.Mode)
+	}
+	if cfg.SessionStore.WALSyncPolicy != "periodic" {
+		t.Errorf("expected WAL sync policy periodic, got %s", cfg.SessionStore.WALSyncPolicy)
+	}
+	if cfg.SessionStore.WALSyncInterval != 250*time.Millisecond {
+		t.Errorf("expected WAL sync interval 250ms, got %v", cfg.SessionStore.WALSyncInterval)
+	}
+	if cfg.SessionStore.WALDir != filepath.Join(cfg.Server.DataDir, "session_wal") {
+		t.Errorf("expected default session WAL dir under data dir, got %s", cfg.SessionStore.WALDir)
+	}
+	if cfg.SessionStore.SnapshotDir != filepath.Join(cfg.Server.DataDir, "session_snapshots") {
+		t.Errorf("expected default session snapshot dir under data dir, got %s", cfg.SessionStore.SnapshotDir)
+	}
+	if cfg.SessionStore.SnapshotInterval != 5*time.Second {
+		t.Errorf("expected snapshot interval 5s, got %v", cfg.SessionStore.SnapshotInterval)
+	}
+	if cfg.SessionStore.SnapshotWALSizeBytes != 1048576 {
+		t.Errorf("expected snapshot WAL size 1048576, got %d", cfg.SessionStore.SnapshotWALSizeBytes)
+	}
+}
+
+func TestLoadConfig_InvalidSessionStoreMode(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "config_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Logf("failed to remove temp dir: %v", err)
+		}
+	}()
+
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+server:
+  data_dir: "` + filepath.Join(tmpDir, "data") + `"
+session_store:
+  mode: persistent
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	if _, err := LoadConfig(configPath); err == nil {
+		t.Fatal("expected invalid session store mode error")
 	}
 }
 
@@ -1137,6 +1196,37 @@ func TestValidatePath_SymlinkEscape(t *testing.T) {
 	_, err = ValidatePath(subDir, symlinkPath)
 	if err != nil {
 		t.Logf("ValidatePath correctly detected symlink escape: %v", err)
+	}
+}
+
+func TestValidatePath_RejectsSymlinkParentEscapeForNewFile(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "gibram_validate_base")
+	if err != nil {
+		t.Fatalf("failed to create base dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(baseDir); err != nil {
+			t.Logf("failed to remove base dir: %v", err)
+		}
+	}()
+	outsideDir, err := os.MkdirTemp("", "gibram_validate_outside")
+	if err != nil {
+		t.Fatalf("failed to create outside dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(outsideDir); err != nil {
+			t.Logf("failed to remove outside dir: %v", err)
+		}
+	}()
+
+	linkPath := filepath.Join(baseDir, "escape")
+	if err := os.Symlink(outsideDir, linkPath); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	_, err = ValidatePath(baseDir, filepath.Join(linkPath, "snapshot.gibram"))
+	if err == nil {
+		t.Fatal("expected symlink parent escape to be rejected")
 	}
 }
 

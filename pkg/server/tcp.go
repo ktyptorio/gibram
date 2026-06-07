@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,13 +93,15 @@ var commandPermissions = map[pb.CommandType]string{
 // =============================================================================
 
 const (
-	ProtocolVersion      = 1
-	DefaultMaxFrameSize  = 64 * 1024 * 1024 // 64MB
-	DefaultVectorDim     = 1536
-	DefaultIdleTimeout   = 300 * time.Second
-	DefaultUnauthTimeout = 10 * time.Second
-	DefaultRateLimit     = 1000
-	DefaultRateBurst     = 100
+	ProtocolVersion        = 1
+	DefaultMaxFrameSize    = 64 * 1024 * 1024 // 64MB
+	DefaultMaxContentBytes = 1 * 1024 * 1024
+	DefaultVectorDim       = 1536
+	DefaultIdleTimeout     = 300 * time.Second
+	DefaultUnauthTimeout   = 10 * time.Second
+	DefaultRateLimit       = 1000
+	DefaultRateBurst       = 100
+	DefaultMaxConnsPerIP   = 50
 )
 
 // =============================================================================
@@ -133,11 +137,15 @@ type Server struct {
 	wal *backup.WAL
 
 	// Connection config (derived from config.Config)
-	maxFrameSize  uint32
-	idleTimeout   time.Duration
-	unauthTimeout time.Duration
-	rateLimit     int
-	rateBurst     int
+	maxFrameSize    uint32
+	maxContentBytes int
+	idleTimeout     time.Duration
+	unauthTimeout   time.Duration
+	rateLimit       int
+	rateBurst       int
+	maxConnsPerIP   int
+	connMu          sync.Mutex
+	connCounts      map[string]int
 }
 
 // NewServer creates a new Protobuf server
@@ -148,21 +156,27 @@ func NewServer(eng *engine.Engine) *Server {
 // NewServerWithConfig creates a new Protobuf server with config
 func NewServerWithConfig(eng *engine.Engine, cfg *config.Config) *Server {
 	s := &Server{
-		engine:        eng,
-		config:        cfg,
-		stopCh:        make(chan struct{}),
-		startTime:     time.Now(),
-		maxFrameSize:  DefaultMaxFrameSize,
-		idleTimeout:   DefaultIdleTimeout,
-		unauthTimeout: DefaultUnauthTimeout,
-		rateLimit:     DefaultRateLimit,
-		rateBurst:     DefaultRateBurst,
+		engine:          eng,
+		config:          cfg,
+		stopCh:          make(chan struct{}),
+		startTime:       time.Now(),
+		maxFrameSize:    DefaultMaxFrameSize,
+		maxContentBytes: DefaultMaxContentBytes,
+		idleTimeout:     DefaultIdleTimeout,
+		unauthTimeout:   DefaultUnauthTimeout,
+		rateLimit:       DefaultRateLimit,
+		rateBurst:       DefaultRateBurst,
+		maxConnsPerIP:   DefaultMaxConnsPerIP,
+		connCounts:      make(map[string]int),
 	}
 
 	// Apply config if provided
 	if cfg != nil {
 		if cfg.Security.MaxFrameSize > 0 {
 			s.maxFrameSize = uint32(cfg.Security.MaxFrameSize)
+		}
+		if cfg.Security.MaxContentBytes > 0 {
+			s.maxContentBytes = cfg.Security.MaxContentBytes
 		}
 		if cfg.Security.IdleTimeout > 0 {
 			s.idleTimeout = cfg.Security.IdleTimeout
@@ -175,6 +189,9 @@ func NewServerWithConfig(eng *engine.Engine, cfg *config.Config) *Server {
 		}
 		if cfg.Security.RateBurst > 0 {
 			s.rateBurst = cfg.Security.RateBurst
+		}
+		if cfg.Security.MaxConnsPerIP > 0 {
+			s.maxConnsPerIP = cfg.Security.MaxConnsPerIP
 		}
 
 		// Setup API key store
@@ -291,9 +308,44 @@ func (s *Server) acceptLoop() {
 				continue
 			}
 		}
+		remoteIP, ok := s.admitConnection(conn)
+		if !ok {
+			if err := conn.Close(); err != nil {
+				logging.Error("Connection close error: %v", err)
+			}
+			continue
+		}
 		s.wg.Add(1)
-		go s.handleConnection(conn)
+		go s.handleConnection(conn, remoteIP)
 	}
+}
+
+func (s *Server) admitConnection(conn net.Conn) (string, bool) {
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		host = conn.RemoteAddr().String()
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.maxConnsPerIP > 0 && s.connCounts[host] >= s.maxConnsPerIP {
+		logging.Warn("Rejecting connection from %s: max connections per IP reached", host)
+		return host, false
+	}
+	s.connCounts[host]++
+	return host, true
+}
+
+func (s *Server) releaseConnection(remoteIP string) {
+	if remoteIP == "" {
+		return
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.connCounts[remoteIP] <= 1 {
+		delete(s.connCounts, remoteIP)
+		return
+	}
+	s.connCounts[remoteIP]--
 }
 
 // connState tracks per-connection state
@@ -303,8 +355,9 @@ type connState struct {
 	limiter       *rate.Limiter
 }
 
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *Server) handleConnection(conn net.Conn, remoteIP string) {
 	defer s.wg.Done()
+	defer s.releaseConnection(remoteIP)
 	defer func() {
 		if err := conn.Close(); err != nil {
 			logging.Error("Connection close error: %v", err)
@@ -516,6 +569,29 @@ func (s *Server) writeEnvelope(w io.Writer, env *pb.Envelope) error {
 func (s *Server) errorPayload(msg string) []byte {
 	data, _ := proto.Marshal(&pb.Error{Message: msg, Code: -1})
 	return data
+}
+
+func (s *Server) validateContentSize(field string, value string) error {
+	if s.maxContentBytes > 0 && len(value) > s.maxContentBytes {
+		return fmt.Errorf("%s too large: %d bytes (max: %d)", field, len(value), s.maxContentBytes)
+	}
+	return nil
+}
+
+func (s *Server) validateContentSizes(fields map[string]string) error {
+	for field, value := range fields {
+		if err := s.validateContentSize(field, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) validatePersistencePath(path string) (string, error) {
+	if path == "" || s.config == nil || s.config.Server.DataDir == "" {
+		return path, nil
+	}
+	return config.ValidatePath(s.config.Server.DataDir, path)
 }
 
 func (s *Server) okPayload(id uint64) []byte {
@@ -759,6 +835,9 @@ func (s *Server) handleInfo(env *pb.Envelope) []byte {
 			CommunityCount:    uint64(info.CommunityCount),
 			VectorDim:         int32(info.VectorDim),
 			SessionCount:      int32(info.SessionCount),
+			SessionStoreMode:  info.SessionStoreMode,
+			WalSyncPolicy:     info.WALSyncPolicy,
+			WalSyncIntervalMs: info.WALSyncIntervalMS,
 		}
 		data, _ := proto.Marshal(resp)
 		return data
@@ -775,12 +854,17 @@ func (s *Server) handleInfo(env *pb.Envelope) []byte {
 		CommunityCount:    uint64(info.CommunityCount),
 		VectorDim:         int32(info.VectorDim),
 		SessionCount:      int32(info.SessionCount),
+		SessionStoreMode:  info.SessionStoreMode,
+		WalSyncPolicy:     info.WALSyncPolicy,
+		WalSyncIntervalMs: info.WALSyncIntervalMS,
 	}
 	data, _ := proto.Marshal(resp)
 	return data
 }
 
 func (s *Server) handleHealth() []byte {
+	info := s.engine.Info()
+	metrics := s.engine.OperationalMetrics()
 	backupStatus := "not_configured"
 	if s.snapshotFn != nil {
 		if s.backupInProgress.Load() {
@@ -793,9 +877,35 @@ func (s *Server) handleHealth() []byte {
 	resp := &pb.HealthResponse{
 		Status: "ok",
 		Components: map[string]string{
-			"engine": "ok",
-			"backup": backupStatus,
+			"engine":                   "ok",
+			"backup":                   backupStatus,
+			"session_store_mode":       info.SessionStoreMode,
+			"session_store":            "ok",
+			"durable_state":            metrics.DurableState,
+			"wal_current_lsn":          strconv.FormatInt(metrics.WALCurrentLSN, 10),
+			"wal_flushed_lsn":          strconv.FormatInt(metrics.WALFlushedLSN, 10),
+			"wal_flush_lag_bytes":      strconv.FormatInt(metrics.WALFlushLagBytes, 10),
+			"wal_size_bytes":           strconv.FormatInt(metrics.WALSizeBytes, 10),
+			"snapshot_status":          metrics.SnapshotStatus,
+			"snapshot_count":           strconv.Itoa(metrics.SnapshotCount),
+			"last_snapshot_unix_nano":  strconv.FormatInt(metrics.LastSnapshotUnixNano, 10),
+			"wal_bytes_since_snapshot": strconv.FormatInt(metrics.WALBytesSinceSnapshot, 10),
+			"recovery_duration_ms":     strconv.FormatInt(metrics.RecoveryDurationMillis, 10),
+			"resource_pressure":        metrics.ResourcePressure,
+			"retrieval_ready":          strconv.FormatBool(metrics.RetrievalReady),
+			"textunit_index_ready":     strconv.FormatBool(metrics.TextUnitIndexReady),
+			"entity_index_ready":       strconv.FormatBool(metrics.EntityIndexReady),
+			"community_index_ready":    strconv.FormatBool(metrics.CommunityIndexReady),
+			"empty_seed_indexes":       metrics.EmptySeedIndexesCSV(),
 		},
+	}
+	if metrics.IsDegraded() {
+		resp.Status = "degraded"
+	}
+	if !info.SessionStoreHealthy {
+		resp.Status = "error"
+		resp.Components["session_store"] = "unhealthy"
+		resp.Components["durable_state"] = "unhealthy"
 	}
 	data, _ := proto.Marshal(resp)
 	return data
@@ -958,8 +1068,8 @@ func (s *Server) handleDeleteDocument(env *pb.Envelope) (pb.CommandType, []byte)
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
-	if !s.engine.DeleteDocument(sessionID, req.Id) {
-		return pb.CommandType_CMD_ERROR, s.errorPayload("document not found")
+	if err := s.engine.DeleteDocumentChecked(sessionID, req.Id); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(req.Id)
@@ -977,6 +1087,9 @@ func (s *Server) handleAddTextUnit(env *pb.Envelope) (pb.CommandType, []byte) {
 
 	var req pb.AddTextUnitRequest
 	if err := proto.Unmarshal(env.Payload, &req); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
+	if err := s.validateContentSize("textunit content", req.Content); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
@@ -1022,8 +1135,8 @@ func (s *Server) handleDeleteTextUnit(env *pb.Envelope) (pb.CommandType, []byte)
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
-	if !s.engine.DeleteTextUnit(sessionID, req.Id) {
-		return pb.CommandType_CMD_ERROR, s.errorPayload("textunit not found")
+	if err := s.engine.DeleteTextUnitChecked(sessionID, req.Id); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(req.Id)
@@ -1059,6 +1172,9 @@ func (s *Server) handleAddEntity(env *pb.Envelope) (pb.CommandType, []byte) {
 
 	var req pb.AddEntityRequest
 	if err := proto.Unmarshal(env.Payload, &req); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
+	if err := s.validateContentSize("entity description", req.Description); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
@@ -1122,6 +1238,9 @@ func (s *Server) handleUpdateEntityDesc(env *pb.Envelope) (pb.CommandType, []byt
 	if err := proto.Unmarshal(env.Payload, &req); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
+	if err := s.validateContentSize("entity description", req.Description); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
 
 	if !s.engine.UpdateEntityDescription(sessionID, req.Id, req.Description, req.Embedding) {
 		return pb.CommandType_CMD_ERROR, s.errorPayload("update failed")
@@ -1141,8 +1260,8 @@ func (s *Server) handleDeleteEntity(env *pb.Envelope) (pb.CommandType, []byte) {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
-	if !s.engine.DeleteEntity(sessionID, req.Id) {
-		return pb.CommandType_CMD_ERROR, s.errorPayload("entity not found")
+	if err := s.engine.DeleteEntityChecked(sessionID, req.Id); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(req.Id)
@@ -1160,6 +1279,9 @@ func (s *Server) handleAddRelationship(env *pb.Envelope) (pb.CommandType, []byte
 
 	var req pb.AddRelationshipRequest
 	if err := proto.Unmarshal(env.Payload, &req); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
+	if err := s.validateContentSize("relationship description", req.Description); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
@@ -1205,8 +1327,8 @@ func (s *Server) handleDeleteRelationship(env *pb.Envelope) (pb.CommandType, []b
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
-	if !s.engine.DeleteRelationship(sessionID, req.Id) {
-		return pb.CommandType_CMD_ERROR, s.errorPayload("relationship not found")
+	if err := s.engine.DeleteRelationshipChecked(sessionID, req.Id); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(req.Id)
@@ -1224,6 +1346,12 @@ func (s *Server) handleAddCommunity(env *pb.Envelope) (pb.CommandType, []byte) {
 
 	var req pb.AddCommunityRequest
 	if err := proto.Unmarshal(env.Payload, &req); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
+	if err := s.validateContentSizes(map[string]string{
+		"community summary":      req.Summary,
+		"community full_content": req.FullContent,
+	}); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
@@ -1269,8 +1397,8 @@ func (s *Server) handleDeleteCommunity(env *pb.Envelope) (pb.CommandType, []byte
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
-	if !s.engine.DeleteCommunity(sessionID, req.Id) {
-		return pb.CommandType_CMD_ERROR, s.errorPayload("community not found")
+	if err := s.engine.DeleteCommunityChecked(sessionID, req.Id); err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(req.Id)
@@ -1426,9 +1554,10 @@ func (s *Server) handleQuery(env *pb.Envelope) (pb.CommandType, []byte) {
 	resp := &pb.QueryResponse{
 		QueryId: result.QueryID,
 		Stats: &pb.QueryStats{
-			DurationMicros:  result.Stats.DurationMicros,
-			VectorSearches:  int32(result.Stats.TextUnitsSearched + result.Stats.EntitiesSearched + result.Stats.CommunitiesSearched),
-			GraphTraversals: int32(result.Stats.EdgesScanned),
+			DurationMicros:     result.Stats.DurationMicros,
+			VectorSearches:     int32(result.Stats.TextUnitsSearched + result.Stats.EntitiesSearched + result.Stats.CommunitiesSearched),
+			GraphTraversals:    int32(result.Stats.EdgesScanned),
+			SkippedSeedIndexes: result.Stats.SkippedSeedIndexes,
 		},
 	}
 
@@ -1523,6 +1652,9 @@ func (s *Server) handleMSetEntities(env *pb.Envelope) (pb.CommandType, []byte) {
 
 	inputs := make([]types.BulkEntityInput, len(req.Entities))
 	for i, e := range req.Entities {
+		if err := s.validateContentSize(fmt.Sprintf("entities[%d].description", i), e.Description); err != nil {
+			return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+		}
 		inputs[i] = types.BulkEntityInput{
 			ExternalID:  e.ExternalId,
 			Title:       e.Title,
@@ -1662,6 +1794,9 @@ func (s *Server) handleMSetTextUnits(env *pb.Envelope) (pb.CommandType, []byte) 
 
 	inputs := make([]types.BulkTextUnitInput, len(req.Textunits))
 	for i, t := range req.Textunits {
+		if err := s.validateContentSize(fmt.Sprintf("textunits[%d].content", i), t.Content); err != nil {
+			return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+		}
 		inputs[i] = types.BulkTextUnitInput{
 			ExternalID: t.ExternalId,
 			DocumentID: t.DocumentId,
@@ -1717,6 +1852,9 @@ func (s *Server) handleMSetRelationships(env *pb.Envelope) (pb.CommandType, []by
 
 	inputs := make([]types.BulkRelationshipInput, len(req.Relationships))
 	for i, r := range req.Relationships {
+		if err := s.validateContentSize(fmt.Sprintf("relationships[%d].description", i), r.Description); err != nil {
+			return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+		}
 		inputs[i] = types.BulkRelationshipInput{
 			ExternalID:  r.ExternalId,
 			SourceID:    r.SourceId,
@@ -1806,6 +1944,9 @@ func (s *Server) handlePipeline(env *pb.Envelope, state *connState) (pb.CommandT
 	for _, cmd := range req.Commands {
 		resp := s.processEnvelope(cmd, state)
 		responses = append(responses, resp)
+		if resp.CmdType == pb.CommandType_CMD_ERROR {
+			break
+		}
 	}
 
 	resp := &pb.PipelineResponse{Responses: responses}
@@ -1836,7 +1977,11 @@ func (s *Server) handleBGSave(payload []byte) (pb.CommandType, []byte) {
 	// Default path if not specified
 	savePath := req.Path
 	if savePath == "" && s.config != nil {
-		savePath = s.config.Server.DataDir + "/snapshot.gibram"
+		savePath = filepath.Join(s.config.Server.DataDir, "snapshot.gibram")
+	}
+	savePath, err := s.validatePersistencePath(savePath)
+	if err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	s.backupInProgress.Store(true)
@@ -1874,7 +2019,11 @@ func (s *Server) handleSave(payload []byte) (pb.CommandType, []byte) {
 	// Default path if not specified
 	savePath := req.Path
 	if savePath == "" && s.config != nil {
-		savePath = s.config.Server.DataDir + "/snapshot.gibram"
+		savePath = filepath.Join(s.config.Server.DataDir, "snapshot.gibram")
+	}
+	savePath, err := s.validatePersistencePath(savePath)
+	if err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
 
 	if err := s.snapshotFn(savePath); err != nil {
@@ -1909,6 +2058,13 @@ func (s *Server) handleBGRestore(payload []byte) (pb.CommandType, []byte) {
 	if err := proto.Unmarshal(payload, &req); err != nil {
 		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
 	}
+	if req.Path == "" {
+		return pb.CommandType_CMD_ERROR, s.errorPayload("restore path is required")
+	}
+	restorePath, err := s.validatePersistencePath(req.Path)
+	if err != nil {
+		return pb.CommandType_CMD_ERROR, s.errorPayload(err.Error())
+	}
 
 	s.backupInProgress.Store(true)
 	s.backupType = "restore"
@@ -1917,12 +2073,12 @@ func (s *Server) handleBGRestore(payload []byte) (pb.CommandType, []byte) {
 	go func() {
 		defer s.backupInProgress.Store(false)
 
-		if err := s.restoreFn(req.Path); err != nil {
+		if err := s.restoreFn(restorePath); err != nil {
 			logging.Error("Background restore failed: %v", err)
 			return
 		}
 
-		logging.Info("Background restore completed from %s", req.Path)
+		logging.Info("Background restore completed from %s", restorePath)
 	}()
 
 	return pb.CommandType_CMD_OK, s.okPayload(0)
@@ -1988,11 +2144,9 @@ func (s *Server) handleWALCheckpoint() (pb.CommandType, []byte) {
 
 	// Also trigger a snapshot if configured
 	if s.snapshotFn != nil {
-		go func() {
-			if err := s.snapshotFn(""); err != nil {
-				logging.Error("Checkpoint snapshot failed: %v", err)
-			}
-		}()
+		if err := s.snapshotFn(""); err != nil {
+			return pb.CommandType_CMD_ERROR, s.errorPayload(fmt.Sprintf("checkpoint snapshot failed: %v", err))
+		}
 	}
 
 	return pb.CommandType_CMD_OK, s.okPayload(s.wal.FlushedLSN())

@@ -140,31 +140,37 @@ tls:
   cert_file: \"\"  # Path to certificate file
   key_file: \"\"   # Path to private key file
   
-  # DEVELOPMENT: Auto-generate self-signed certificate
-  auto_cert: true
+  # DEVELOPMENT ONLY: Auto-generate self-signed certificate.
+  # Keep false for production; provide cert_file/key_file instead.
+  auto_cert: false
   
   # INSECURE MODE (DEV ONLY): Start with --insecure flag to disable TLS
   # gibram-server --insecure
 
 auth:
   keys:
-    # Admin key - full access
+    # Admin key - full access. Use bcrypt key_hash in production.
     - id: \"admin\"
-      key: \"gibram_admin_change_me_in_production\"
+      key_hash: \"\$2a\$12\$replace_with_bcrypt_hash_for_admin_key\"
       permissions: [\"admin\"]
     
     # Application key - read/write access
     - id: \"app-service\"
-      key: \"gibram_app_change_me_in_production\"
+      key_hash: \"\$2a\$12\$replace_with_bcrypt_hash_for_app_key\"
       permissions: [\"write\"]
     
     # Read-only key
     - id: \"query-service\"
-      key: \"gibram_query_change_me_in_production\"
+      key_hash: \"\$2a\$12\$replace_with_bcrypt_hash_for_query_key\"
       permissions: [\"read\"]
 
 security:
   max_frame_size: 4194304  # 4MB
+  max_content_bytes: 1048576
+  max_memory_bytes: 0
+  max_session_documents: 0
+  max_session_entities: 0
+  max_session_relationships: 0
   rate_limit: 1000         # requests per second
   rate_burst: 100
   idle_timeout: 300s

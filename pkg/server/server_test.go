@@ -2,9 +2,15 @@
 package server
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +101,14 @@ func mustUnmarshal(tb testing.TB, payload []byte, msg proto.Message) {
 	}
 }
 
+func mustMarshal(m proto.Message) []byte {
+	data, err := proto.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
 func closeSilently(c io.Closer) {
 	if c == nil {
 		return
@@ -113,6 +127,18 @@ func mustSendCommand(tb testing.TB, conn net.Conn, cmdType pb.CommandType, paylo
 	return resp
 }
 
+func assertServerErrorContains(tb testing.TB, resp *pb.Envelope, want string) {
+	tb.Helper()
+	if resp.CmdType != pb.CommandType_CMD_ERROR {
+		tb.Fatalf("Expected CMD_ERROR, got %v", resp.CmdType)
+	}
+	var errResp pb.Error
+	mustUnmarshal(tb, resp.Payload, &errResp)
+	if !strings.Contains(errResp.Message, want) {
+		tb.Fatalf("Expected error containing %q, got %q", want, errResp.Message)
+	}
+}
+
 // =============================================================================
 // Server Creation Tests
 // =============================================================================
@@ -127,6 +153,82 @@ func TestNewServer(t *testing.T) {
 
 	if srv.engine != eng {
 		t.Error("Server should have engine reference")
+	}
+}
+
+func TestReadEnvelopeRejectsOversizedFrame(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Security.MaxFrameSize = 8
+	srv := NewServerWithConfig(engine.NewEngine(testVectorDim), cfg)
+
+	var buf bytes.Buffer
+	buf.WriteByte(byte(codec.CodecProtobuf))
+	if err := binary.Write(&buf, binary.BigEndian, uint32(9)); err != nil {
+		t.Fatalf("binary.Write failed: %v", err)
+	}
+
+	_, err := srv.readEnvelope(&buf)
+	if err == nil {
+		t.Fatal("expected oversized frame error")
+	}
+	if !strings.Contains(err.Error(), "frame too large") {
+		t.Fatalf("expected frame too large error, got %v", err)
+	}
+}
+
+func TestAddTextUnitRejectsOversizedContent(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Security.MaxContentBytes = 3
+	eng := engine.NewEngine(testVectorDim)
+	if _, err := eng.AddDocument(testSessionID, "doc-1", "one.txt"); err != nil {
+		t.Fatalf("AddDocument failed: %v", err)
+	}
+	srv := NewServerWithConfig(eng, cfg)
+
+	payload := mustMarshal(&pb.AddTextUnitRequest{
+		ExternalId: "tu-1",
+		DocumentId: 1,
+		Content:    "abcd",
+	})
+	respType, respPayload := srv.handleAddTextUnit(&pb.Envelope{
+		Version:   ProtocolVersion,
+		RequestId: 1,
+		CmdType:   pb.CommandType_CMD_ADD_TEXTUNIT,
+		SessionId: testSessionID,
+		Payload:   payload,
+	})
+	assertServerErrorContains(t, &pb.Envelope{CmdType: respType, Payload: respPayload}, "textunit content too large")
+	info, err := eng.GetSessionInfo(testSessionID)
+	if err != nil {
+		t.Fatalf("GetInfo failed: %v", err)
+	}
+	if got := info.TextUnitCount; got != 0 {
+		t.Fatalf("oversized content request mutated textunit count: got %d", got)
+	}
+}
+
+func TestAdmitConnectionEnforcesMaxConnsPerIP(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Security.MaxConnsPerIP = 1
+	srv := NewServerWithConfig(engine.NewEngine(testVectorDim), cfg)
+
+	conn1, peer1 := net.Pipe()
+	defer closeSilently(conn1)
+	defer closeSilently(peer1)
+	conn2, peer2 := net.Pipe()
+	defer closeSilently(conn2)
+	defer closeSilently(peer2)
+
+	remoteIP, ok := srv.admitConnection(conn1)
+	if !ok {
+		t.Fatal("expected first connection to be admitted")
+	}
+	if _, ok := srv.admitConnection(conn2); ok {
+		t.Fatal("expected second connection from same IP to be rejected")
+	}
+	srv.releaseConnection(remoteIP)
+	if _, ok := srv.admitConnection(conn2); !ok {
+		t.Fatal("expected connection after release to be admitted")
 	}
 }
 
@@ -374,6 +476,54 @@ func TestServerSetSnapshotCallback(t *testing.T) {
 	}
 }
 
+func TestWALCheckpointWaitsForSnapshotAndReturnsSnapshotFailure(t *testing.T) {
+	eng := engine.NewEngine(testVectorDim)
+	srv := NewServer(eng)
+	wal, err := backup.NewWAL(t.TempDir(), backup.SyncNever)
+	if err != nil {
+		t.Fatalf("create WAL: %v", err)
+	}
+	defer closeSilently(wal)
+	srv.SetWAL(wal)
+
+	snapshotStarted := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	srv.SetSnapshotCallback(func(path string) error {
+		close(snapshotStarted)
+		<-releaseSnapshot
+		return errors.New("durable snapshot publish failed")
+	})
+
+	type result struct {
+		cmdType pb.CommandType
+		payload []byte
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		cmdType, payload := srv.handleWALCheckpoint()
+		resultCh <- result{cmdType: cmdType, payload: payload}
+	}()
+
+	select {
+	case <-snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint did not start snapshot")
+	}
+	select {
+	case <-resultCh:
+		t.Fatal("checkpoint returned before durable snapshot completed")
+	default:
+	}
+
+	close(releaseSnapshot)
+	select {
+	case got := <-resultCh:
+		assertServerErrorContains(t, &pb.Envelope{CmdType: got.cmdType, Payload: got.payload}, "durable snapshot publish failed")
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint did not return snapshot failure")
+	}
+}
+
 func TestServerSetRestoreCallback(t *testing.T) {
 	eng := engine.NewEngine(testVectorDim)
 	srv := NewServer(eng)
@@ -531,6 +681,55 @@ func TestServerIntegration_AddAndRetrieveDocument(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_AddDocumentRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{Filename: "test.pdf"})
+	if err != nil {
+		t.Fatalf("Add document failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "document external_id is required")
+}
+
+func TestServerIntegration_AddDocumentAllowsDuplicateFilename(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp1 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "doc-shared-filename-1",
+		Filename:   "shared.pdf",
+	})
+	if resp1.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, resp1.Payload, &errResp)
+		t.Fatalf("First AddDocument returned error: %s", errResp.Message)
+	}
+
+	resp2 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "doc-shared-filename-2",
+		Filename:   "shared.pdf",
+	})
+	if resp2.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, resp2.Payload, &errResp)
+		t.Fatalf("Second AddDocument returned error: %s", errResp.Message)
+	}
+}
+
 func TestServerIntegration_Info(t *testing.T) {
 	srv, addr := createTestServer(t)
 	defer srv.Stop()
@@ -582,6 +781,89 @@ func TestServerIntegration_Health(t *testing.T) {
 	}
 }
 
+func TestHealthExposesDurabilityAndReadinessMetrics(t *testing.T) {
+	eng, err := engine.NewEngineWithOptions(engine.Options{
+		VectorDim: testVectorDim,
+		StoreMode: "durable",
+		Durable: engine.DurableOptions{
+			WALDir:      filepath.Join(t.TempDir(), "wal"),
+			SnapshotDir: filepath.Join(t.TempDir(), "snapshots"),
+			SyncPolicy:  "every_write",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEngineWithOptions failed: %v", err)
+	}
+	defer func() {
+		if err := eng.Close(); err != nil {
+			t.Fatalf("engine close failed: %v", err)
+		}
+	}()
+	srv := NewServer(eng)
+
+	var health pb.HealthResponse
+	if err := proto.Unmarshal(srv.handleHealth(), &health); err != nil {
+		t.Fatalf("unmarshal health failed: %v", err)
+	}
+
+	if health.Status != "ok" {
+		t.Fatalf("expected ok health, got %s (%v)", health.Status, health.Components)
+	}
+	for _, key := range []string{
+		"durable_state",
+		"wal_current_lsn",
+		"wal_flushed_lsn",
+		"wal_flush_lag_bytes",
+		"wal_size_bytes",
+		"snapshot_status",
+		"snapshot_count",
+		"recovery_duration_ms",
+		"resource_pressure",
+		"retrieval_ready",
+		"empty_seed_indexes",
+	} {
+		if _, ok := health.Components[key]; !ok {
+			t.Fatalf("expected health component %q in %v", key, health.Components)
+		}
+	}
+	if health.Components["durable_state"] != "serving" {
+		t.Fatalf("expected durable_state serving, got %s", health.Components["durable_state"])
+	}
+	if health.Components["retrieval_ready"] != "false" {
+		t.Fatalf("expected retrieval_ready false before embeddings, got %s", health.Components["retrieval_ready"])
+	}
+	if !strings.Contains(health.Components["empty_seed_indexes"], "textunit") {
+		t.Fatalf("expected empty_seed_indexes to include textunit, got %s", health.Components["empty_seed_indexes"])
+	}
+}
+
+func TestHealthReportsDegradedResourcePressure(t *testing.T) {
+	eng, err := engine.NewEngineWithOptions(engine.Options{
+		VectorDim: testVectorDim,
+		ResourceLimits: engine.ResourceLimits{
+			MaxMemoryBytes: 200,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEngineWithOptions failed: %v", err)
+	}
+	if _, err := eng.AddDocument(testSessionID, strings.Repeat("d", 40), strings.Repeat("f", 20)); err != nil {
+		t.Fatalf("AddDocument failed: %v", err)
+	}
+	srv := NewServer(eng)
+
+	var health pb.HealthResponse
+	if err := proto.Unmarshal(srv.handleHealth(), &health); err != nil {
+		t.Fatalf("unmarshal health failed: %v", err)
+	}
+	if health.Status != "degraded" {
+		t.Fatalf("expected degraded health, got %s (%v)", health.Status, health.Components)
+	}
+	if got := health.Components["resource_pressure"]; got != "critical" {
+		t.Fatalf("expected critical resource pressure, got %s", got)
+	}
+}
+
 // =============================================================================
 // Entity Operations Integration Tests
 // =============================================================================
@@ -628,6 +910,104 @@ func TestServerIntegration_AddEntity(t *testing.T) {
 
 	if addResp.Id == 0 {
 		t.Error("Entity ID should not be 0")
+	}
+}
+
+func TestServerIntegration_AddEntityRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		Title: "Missing External ID",
+		Type:  "person",
+	})
+	if err != nil {
+		t.Fatalf("Add entity failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "entity external_id is required")
+}
+
+func TestServerIntegration_AddEntityRejectsDuplicateNormalizedTitle(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp1 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "entity-title-1",
+		Title:      "Bank Indonesia",
+		Type:       "organization",
+	})
+	if resp1.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, resp1.Payload, &errResp)
+		t.Fatalf("First AddEntity returned error: %s", errResp.Message)
+	}
+
+	resp2, err := sendCommand(conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "entity-title-2",
+		Title:      " bank indonesia ",
+		Type:       "organization",
+	})
+	if err != nil {
+		t.Fatalf("Add entity failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp2, "entity with title  bank indonesia  already exists")
+}
+
+func TestServerIntegration_AddEntityRejectsInvalidEmbedding(t *testing.T) {
+	tests := []struct {
+		name      string
+		embedding []float32
+		want      string
+	}{
+		{
+			name:      "wrong dimension",
+			embedding: make([]float32, testVectorDim-1),
+			want:      "entity embedding dimension mismatch",
+		},
+		{
+			name:      "non finite",
+			embedding: append([]float32{float32(math.NaN())}, make([]float32, testVectorDim-1)...),
+			want:      "entity embedding contains non-finite value at index 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, addr := createTestServer(t)
+			defer srv.Stop()
+
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Failed to connect: %v", err)
+			}
+			defer closeSilently(conn)
+
+			resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+				ExternalId: "entity-invalid-embedding",
+				Title:      "Invalid Embedding Entity",
+				Type:       "test",
+				Embedding:  tt.embedding,
+			})
+			if err != nil {
+				t.Fatalf("Add entity failed: %v", err)
+			}
+
+			assertServerErrorContains(t, resp, tt.want)
+		})
 	}
 }
 
@@ -682,6 +1062,112 @@ func TestServerIntegration_AddTextUnit(t *testing.T) {
 
 	if addResp.Id == 0 {
 		t.Error("TextUnit ID should not be 0")
+	}
+}
+
+func TestServerIntegration_AddTextUnitRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	docResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "doc-for-missing-tu-external-id",
+		Filename:   "test.pdf",
+	})
+	var docID pb.OkWithID
+	mustUnmarshal(t, docResp.Payload, &docID)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_TEXTUNIT, &pb.AddTextUnitRequest{
+		DocumentId: docID.Id,
+		Content:    "This chunk is missing external identity.",
+		Embedding:  make([]float32, testVectorDim),
+		TokenCount: 8,
+	})
+	if err != nil {
+		t.Fatalf("Add text unit failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "textunit external_id is required")
+}
+
+func TestServerIntegration_AddTextUnitRequiresExistingDocument(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_TEXTUNIT, &pb.AddTextUnitRequest{
+		ExternalId: "tu-missing-doc",
+		DocumentId: 999,
+		Content:    "This chunk references a missing document.",
+		Embedding:  make([]float32, testVectorDim),
+		TokenCount: 8,
+	})
+	if err != nil {
+		t.Fatalf("Add text unit failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "textunit document_id 999 does not exist")
+}
+
+func TestServerIntegration_AddTextUnitRejectsInvalidEmbedding(t *testing.T) {
+	tests := []struct {
+		name      string
+		embedding []float32
+		want      string
+	}{
+		{
+			name:      "wrong dimension",
+			embedding: make([]float32, testVectorDim-1),
+			want:      "textunit embedding dimension mismatch",
+		},
+		{
+			name:      "non finite",
+			embedding: append([]float32{float32(math.NaN())}, make([]float32, testVectorDim-1)...),
+			want:      "textunit embedding contains non-finite value at index 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, addr := createTestServer(t)
+			defer srv.Stop()
+
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Failed to connect: %v", err)
+			}
+			defer closeSilently(conn)
+
+			docResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+				ExternalId: "doc-invalid-tu-embedding",
+				Filename:   "test.pdf",
+			})
+			var docID pb.OkWithID
+			mustUnmarshal(t, docResp.Payload, &docID)
+
+			resp, err := sendCommand(conn, pb.CommandType_CMD_ADD_TEXTUNIT, &pb.AddTextUnitRequest{
+				ExternalId: "tu-invalid-embedding",
+				DocumentId: docID.Id,
+				Content:    "This chunk has an invalid embedding.",
+				Embedding:  tt.embedding,
+				TokenCount: 8,
+			})
+			if err != nil {
+				t.Fatalf("Add text unit failed: %v", err)
+			}
+
+			assertServerErrorContains(t, resp, tt.want)
+		})
 	}
 }
 
@@ -753,6 +1239,155 @@ func TestServerIntegration_AddRelationship(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_AddRelationshipAllowsSameSourceTargetWithDifferentType(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp1 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "rel-identity-ent-1",
+		Title:      "Relationship Identity Entity 1",
+		Type:       "test",
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, resp1.Payload, &ent1ID)
+
+	resp2 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "rel-identity-ent-2",
+		Title:      "Relationship Identity Entity 2",
+		Type:       "test",
+	})
+	var ent2ID pb.OkWithID
+	mustUnmarshal(t, resp2.Payload, &ent2ID)
+
+	first := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-identity-1",
+		SourceId:   ent1ID.Id,
+		TargetId:   ent2ID.Id,
+		Type:       "KNOWS",
+		Weight:     1.0,
+	})
+	if first.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, first.Payload, &errResp)
+		t.Fatalf("First AddRelationship returned error: %s", errResp.Message)
+	}
+
+	second := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-identity-2",
+		SourceId:   ent1ID.Id,
+		TargetId:   ent2ID.Id,
+		Type:       "WORKS_WITH",
+		Weight:     1.0,
+	})
+	if second.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, second.Payload, &errResp)
+		t.Fatalf("Second AddRelationship returned error: %s", errResp.Message)
+	}
+}
+
+func TestServerIntegration_AddRelationshipRejectsDuplicateSourceTargetType(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp1 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "rel-duplicate-ent-1",
+		Title:      "Relationship Duplicate Entity 1",
+		Type:       "test",
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, resp1.Payload, &ent1ID)
+
+	resp2 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "rel-duplicate-ent-2",
+		Title:      "Relationship Duplicate Entity 2",
+		Type:       "test",
+	})
+	var ent2ID pb.OkWithID
+	mustUnmarshal(t, resp2.Payload, &ent2ID)
+
+	first := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-duplicate-1",
+		SourceId:   ent1ID.Id,
+		TargetId:   ent2ID.Id,
+		Type:       "KNOWS",
+		Weight:     1.0,
+	})
+	if first.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, first.Payload, &errResp)
+		t.Fatalf("First AddRelationship returned error: %s", errResp.Message)
+	}
+
+	duplicate, err := sendCommand(conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-duplicate-2",
+		SourceId:   ent1ID.Id,
+		TargetId:   ent2ID.Id,
+		Type:       "KNOWS",
+		Weight:     1.0,
+	})
+	if err != nil {
+		t.Fatalf("Add relationship failed: %v", err)
+	}
+
+	assertServerErrorContains(t, duplicate, "relationship from 1 to 2 with type KNOWS already exists")
+}
+
+func TestServerIntegration_AddRelationshipRequiresExistingEntities(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp1 := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "rel-existing-ent-1",
+		Title:      "Relationship Existing Entity 1",
+		Type:       "test",
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, resp1.Payload, &ent1ID)
+
+	missingTarget, err := sendCommand(conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-missing-target",
+		SourceId:   ent1ID.Id,
+		TargetId:   999,
+		Type:       "KNOWS",
+		Weight:     1.0,
+	})
+	if err != nil {
+		t.Fatalf("Add relationship failed: %v", err)
+	}
+	assertServerErrorContains(t, missingTarget, "relationship target_id 999 does not exist")
+
+	missingSource, err := sendCommand(conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "rel-missing-source",
+		SourceId:   999,
+		TargetId:   ent1ID.Id,
+		Type:       "KNOWS",
+		Weight:     1.0,
+	})
+	if err != nil {
+		t.Fatalf("Add relationship failed: %v", err)
+	}
+	assertServerErrorContains(t, missingSource, "relationship source_id 999 does not exist")
+}
+
 // =============================================================================
 // Query Integration Tests
 // =============================================================================
@@ -819,6 +1454,41 @@ func TestServerIntegration_Query(t *testing.T) {
 	if queryResp.QueryId == 0 {
 		t.Error("QueryID should not be 0")
 	}
+	if got, want := queryResp.Stats.SkippedSeedIndexes, []string{"textunit"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Expected skipped seed indexes %v, got %v", want, got)
+	}
+}
+
+func TestServerIntegration_QueryRetrievalReadyError(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "retrieval-not-ready-doc",
+		Filename:   "not_ready.pdf",
+	})
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_QUERY, &pb.QueryRequest{
+		QueryVector:    make([]float32, testVectorDim),
+		TopK:           5,
+		KHops:          0,
+		MaxTextunits:   10,
+		MaxEntities:    10,
+		MaxCommunities: 5,
+		SearchTypes:    []string{"textunit", "entity"},
+	})
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "retrieval ready error")
+	assertServerErrorContains(t, resp, "no requested seed indexes have embeddings")
 }
 
 // =============================================================================
@@ -1582,6 +2252,129 @@ func TestServerIntegration_AddCommunity(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_AddCommunityWithValidatedReferencesCanBeRetrieved(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	ent1Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "comm-ref-ent-1",
+		Title:      "Community Reference Entity 1",
+		Type:       "test",
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, ent1Resp.Payload, &ent1ID)
+
+	ent2Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "comm-ref-ent-2",
+		Title:      "Community Reference Entity 2",
+		Type:       "test",
+	})
+	var ent2ID pb.OkWithID
+	mustUnmarshal(t, ent2Resp.Payload, &ent2ID)
+
+	relResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "comm-ref-rel-1",
+		SourceId:   ent1ID.Id,
+		TargetId:   ent2ID.Id,
+		Type:       "RELATED",
+		Weight:     1.0,
+	})
+	var relID pb.OkWithID
+	mustUnmarshal(t, relResp.Payload, &relID)
+
+	addResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_COMMUNITY, &pb.AddCommunityRequest{
+		ExternalId:      "comm-ref-test",
+		Title:           "Referenced Community",
+		Summary:         "A community for reference validation",
+		FullContent:     "Full content",
+		Level:           0,
+		EntityIds:       []uint64{ent1ID.Id, ent2ID.Id},
+		RelationshipIds: []uint64{relID.Id},
+		Embedding:       make([]float32, testVectorDim),
+	})
+	if addResp.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, addResp.Payload, &errResp)
+		t.Fatalf("AddCommunity returned error: %s", errResp.Message)
+	}
+	var commID pb.OkWithID
+	mustUnmarshal(t, addResp.Payload, &commID)
+
+	getResp := mustSendCommand(t, conn, pb.CommandType_CMD_GET_COMMUNITY, &pb.GetByIDRequest{Id: commID.Id})
+	if getResp.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, getResp.Payload, &errResp)
+		t.Fatalf("GetCommunity returned error: %s", errResp.Message)
+	}
+	var comm pb.Community
+	mustUnmarshal(t, getResp.Payload, &comm)
+	if len(comm.EntityIds) != 2 {
+		t.Fatalf("Expected 2 community entity references, got %d", len(comm.EntityIds))
+	}
+	if len(comm.RelationshipIds) != 1 || comm.RelationshipIds[0] != relID.Id {
+		t.Fatalf("Expected relationship reference %d, got %v", relID.Id, comm.RelationshipIds)
+	}
+}
+
+func TestServerIntegration_AddCommunityRejectsInvalidReferencesAndEmbedding(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	entResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "comm-invalid-ent-1",
+		Title:      "Community Invalid Entity 1",
+		Type:       "test",
+	})
+	var entID pb.OkWithID
+	mustUnmarshal(t, entResp.Payload, &entID)
+
+	missingEntity, err := sendCommand(conn, pb.CommandType_CMD_ADD_COMMUNITY, &pb.AddCommunityRequest{
+		ExternalId: "comm-missing-entity",
+		Title:      "Missing Entity Community",
+		EntityIds:  []uint64{entID.Id, 999},
+		Embedding:  make([]float32, testVectorDim),
+	})
+	if err != nil {
+		t.Fatalf("Add community failed: %v", err)
+	}
+	assertServerErrorContains(t, missingEntity, "community entity_id 999 does not exist")
+
+	missingRel, err := sendCommand(conn, pb.CommandType_CMD_ADD_COMMUNITY, &pb.AddCommunityRequest{
+		ExternalId:      "comm-missing-rel",
+		Title:           "Missing Relationship Community",
+		EntityIds:       []uint64{entID.Id},
+		RelationshipIds: []uint64{999},
+		Embedding:       make([]float32, testVectorDim),
+	})
+	if err != nil {
+		t.Fatalf("Add community failed: %v", err)
+	}
+	assertServerErrorContains(t, missingRel, "community relationship_id 999 does not exist")
+
+	invalidEmbedding, err := sendCommand(conn, pb.CommandType_CMD_ADD_COMMUNITY, &pb.AddCommunityRequest{
+		ExternalId: "comm-invalid-embedding",
+		Title:      "Invalid Embedding Community",
+		EntityIds:  []uint64{entID.Id},
+		Embedding:  make([]float32, testVectorDim-1),
+	})
+	if err != nil {
+		t.Fatalf("Add community failed: %v", err)
+	}
+	assertServerErrorContains(t, invalidEmbedding, "community embedding dimension mismatch")
+}
+
 func TestServerIntegration_GetCommunity(t *testing.T) {
 	srv, addr := createTestServer(t)
 	defer srv.Stop()
@@ -1662,6 +2455,135 @@ func TestServerIntegration_DeleteCommunity(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_RestrictedDelete(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	embedding := make([]float32, testVectorDim)
+
+	docResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "restricted-doc",
+		Filename:   "restricted.pdf",
+	})
+	var docID pb.OkWithID
+	mustUnmarshal(t, docResp.Payload, &docID)
+
+	tuResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_TEXTUNIT, &pb.AddTextUnitRequest{
+		ExternalId: "restricted-tu",
+		DocumentId: docID.Id,
+		Content:    "Restricted delete text unit",
+		Embedding:  embedding,
+		TokenCount: 4,
+	})
+	var tuID pb.OkWithID
+	mustUnmarshal(t, tuResp.Payload, &tuID)
+
+	deleteDoc, err := sendCommand(conn, pb.CommandType_CMD_DELETE_DOCUMENT, &pb.DeleteByIDRequest{Id: docID.Id})
+	if err != nil {
+		t.Fatalf("Delete document failed: %v", err)
+	}
+	assertServerErrorContains(t, deleteDoc, "document 1 has dependent text units")
+
+	entResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "restricted-ent",
+		Title:      "Restricted Delete Entity",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var entID pb.OkWithID
+	mustUnmarshal(t, entResp.Payload, &entID)
+
+	linkResp := mustSendCommand(t, conn, pb.CommandType_CMD_LINK_TEXTUNIT_ENTITY, &pb.LinkTextUnitEntityRequest{
+		TextunitId: tuID.Id,
+		EntityId:   entID.Id,
+	})
+	if linkResp.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, linkResp.Payload, &errResp)
+		t.Fatalf("LinkTextUnitEntity returned error: %s", errResp.Message)
+	}
+
+	deleteTU, err := sendCommand(conn, pb.CommandType_CMD_DELETE_TEXTUNIT, &pb.DeleteByIDRequest{Id: tuID.Id})
+	if err != nil {
+		t.Fatalf("Delete text unit failed: %v", err)
+	}
+	assertServerErrorContains(t, deleteTU, "textunit 1 is linked to entities")
+
+	deleteEnt, err := sendCommand(conn, pb.CommandType_CMD_DELETE_ENTITY, &pb.DeleteByIDRequest{Id: entID.Id})
+	if err != nil {
+		t.Fatalf("Delete entity failed: %v", err)
+	}
+	assertServerErrorContains(t, deleteEnt, "entity 1 is linked to text units")
+
+	relEnt1Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "restricted-rel-ent-1",
+		Title:      "Restricted Relationship Entity 1",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var relEnt1ID pb.OkWithID
+	mustUnmarshal(t, relEnt1Resp.Payload, &relEnt1ID)
+
+	relEnt2Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "restricted-rel-ent-2",
+		Title:      "Restricted Relationship Entity 2",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var relEnt2ID pb.OkWithID
+	mustUnmarshal(t, relEnt2Resp.Payload, &relEnt2ID)
+
+	relResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_RELATIONSHIP, &pb.AddRelationshipRequest{
+		ExternalId: "restricted-rel",
+		SourceId:   relEnt1ID.Id,
+		TargetId:   relEnt2ID.Id,
+		Type:       "RELATED",
+		Weight:     1.0,
+	})
+	var relID pb.OkWithID
+	mustUnmarshal(t, relResp.Payload, &relID)
+
+	deleteRelEnt, err := sendCommand(conn, pb.CommandType_CMD_DELETE_ENTITY, &pb.DeleteByIDRequest{Id: relEnt1ID.Id})
+	if err != nil {
+		t.Fatalf("Delete entity failed: %v", err)
+	}
+	assertServerErrorContains(t, deleteRelEnt, "entity 2 is linked to relationships")
+
+	deleteRel, err := sendCommand(conn, pb.CommandType_CMD_DELETE_RELATIONSHIP, &pb.DeleteByIDRequest{Id: relID.Id})
+	if err != nil {
+		t.Fatalf("Delete relationship failed: %v", err)
+	}
+	if deleteRel.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, deleteRel.Payload, &errResp)
+		t.Fatalf("Delete relationship without dependents returned error: %s", errResp.Message)
+	}
+
+	commResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_COMMUNITY, &pb.AddCommunityRequest{
+		ExternalId: "restricted-comm",
+		Title:      "Restricted Community",
+		Embedding:  embedding,
+	})
+	var commID pb.OkWithID
+	mustUnmarshal(t, commResp.Payload, &commID)
+
+	deleteComm, err := sendCommand(conn, pb.CommandType_CMD_DELETE_COMMUNITY, &pb.DeleteByIDRequest{Id: commID.Id})
+	if err != nil {
+		t.Fatalf("Delete community failed: %v", err)
+	}
+	if deleteComm.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, deleteComm.Payload, &errResp)
+		t.Fatalf("Delete community without dependents returned error: %s", errResp.Message)
+	}
+}
+
 func TestServerIntegration_ComputeCommunities(t *testing.T) {
 	srv, addr := createTestServer(t)
 	defer srv.Stop()
@@ -1738,6 +2660,233 @@ func TestServerIntegration_HierarchicalLeiden(t *testing.T) {
 		var errResp pb.Error
 		mustUnmarshal(t, resp.Payload, &errResp)
 		t.Logf("Hierarchical Leiden returned error (may be expected): %s", errResp.Message)
+	}
+}
+
+func TestServerIntegration_AtomicBulkWritesRejectPartialState(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	embedding := make([]float32, testVectorDim)
+
+	docBulk, err := sendCommand(conn, pb.CommandType_CMD_MSET_DOCUMENTS, &pb.MSetDocumentsRequest{
+		Documents: []*pb.AddDocumentRequest{
+			{ExternalId: "atomic-doc-valid", Filename: "valid.pdf"},
+			{Filename: "missing-external-id.pdf"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet documents failed: %v", err)
+	}
+	assertServerErrorContains(t, docBulk, "atomic bulk documents failed at index 1")
+	assertServerErrorContains(t, docBulk, "no items committed")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.DocumentCount != 0 {
+		t.Fatalf("Expected no documents after failed bulk documents, got %d", info.DocumentCount)
+	}
+
+	docResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "atomic-tu-doc",
+		Filename:   "textunits.pdf",
+	})
+	var docID pb.OkWithID
+	mustUnmarshal(t, docResp.Payload, &docID)
+
+	tuBulk, err := sendCommand(conn, pb.CommandType_CMD_MSET_TEXTUNITS, &pb.MSetTextUnitsRequest{
+		Textunits: []*pb.AddTextUnitRequest{
+			{ExternalId: "atomic-tu-valid", DocumentId: docID.Id, Content: "Valid", Embedding: embedding, TokenCount: 1},
+			{DocumentId: docID.Id, Content: "Invalid", Embedding: embedding, TokenCount: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet text units failed: %v", err)
+	}
+	assertServerErrorContains(t, tuBulk, "atomic bulk textunits failed at index 1")
+	assertServerErrorContains(t, tuBulk, "no items committed")
+
+	infoResp = mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.TextunitCount != 0 {
+		t.Fatalf("Expected no text units after failed bulk textunits, got %d", info.TextunitCount)
+	}
+
+	entityBulk, err := sendCommand(conn, pb.CommandType_CMD_MSET_ENTITIES, &pb.MSetEntitiesRequest{
+		Entities: []*pb.AddEntityRequest{
+			{ExternalId: "atomic-ent-valid", Title: "Atomic Entity Valid", Type: "test", Embedding: embedding},
+			{Title: "Atomic Entity Missing External ID", Type: "test", Embedding: embedding},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet entities failed: %v", err)
+	}
+	assertServerErrorContains(t, entityBulk, "atomic bulk entities failed at index 1")
+	assertServerErrorContains(t, entityBulk, "no items committed")
+
+	infoResp = mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.EntityCount != 0 {
+		t.Fatalf("Expected no entities after failed bulk entities, got %d", info.EntityCount)
+	}
+
+	ent1Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "atomic-rel-ent-1",
+		Title:      "Atomic Relationship Entity 1",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, ent1Resp.Payload, &ent1ID)
+
+	ent2Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "atomic-rel-ent-2",
+		Title:      "Atomic Relationship Entity 2",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var ent2ID pb.OkWithID
+	mustUnmarshal(t, ent2Resp.Payload, &ent2ID)
+
+	relationshipBulk, err := sendCommand(conn, pb.CommandType_CMD_MSET_RELATIONSHIPS, &pb.MSetRelationshipsRequest{
+		Relationships: []*pb.AddRelationshipRequest{
+			{ExternalId: "atomic-rel-valid", SourceId: ent1ID.Id, TargetId: ent2ID.Id, Type: "RELATED", Weight: 1},
+			{ExternalId: "atomic-rel-invalid", SourceId: ent1ID.Id, TargetId: 999, Type: "RELATED", Weight: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet relationships failed: %v", err)
+	}
+	assertServerErrorContains(t, relationshipBulk, "atomic bulk relationships failed at index 1")
+	assertServerErrorContains(t, relationshipBulk, "no items committed")
+
+	infoResp = mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.RelationshipCount != 0 {
+		t.Fatalf("Expected no relationships after failed bulk relationships, got %d", info.RelationshipCount)
+	}
+}
+
+func pipelineCommand(cmdType pb.CommandType, payload proto.Message) *pb.Envelope {
+	return &pb.Envelope{
+		Version:   ProtocolVersion,
+		RequestId: uint64(cmdType),
+		CmdType:   cmdType,
+		SessionId: testSessionID,
+		Payload:   mustMarshal(payload),
+	}
+}
+
+func TestServerIntegration_PipelineSuccess(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp := mustSendCommand(t, conn, pb.CommandType_CMD_PIPELINE, &pb.PipelineRequest{
+		Commands: []*pb.Envelope{
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{ExternalId: "pipe-success-doc-1", Filename: "one.pdf"}),
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{ExternalId: "pipe-success-doc-2", Filename: "two.pdf"}),
+		},
+	})
+	if resp.CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, resp.Payload, &errResp)
+		t.Fatalf("Pipeline returned error: %s", errResp.Message)
+	}
+
+	var pipeResp pb.PipelineResponse
+	mustUnmarshal(t, resp.Payload, &pipeResp)
+	if len(pipeResp.Responses) != 2 {
+		t.Fatalf("Expected 2 pipeline responses, got %d", len(pipeResp.Responses))
+	}
+	for i, inner := range pipeResp.Responses {
+		if inner.CmdType == pb.CommandType_CMD_ERROR {
+			var errResp pb.Error
+			mustUnmarshal(t, inner.Payload, &errResp)
+			t.Fatalf("Pipeline response %d returned error: %s", i, errResp.Message)
+		}
+	}
+}
+
+func TestServerIntegration_PipelineStopsOnFirstCommandFailure(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp := mustSendCommand(t, conn, pb.CommandType_CMD_PIPELINE, &pb.PipelineRequest{
+		Commands: []*pb.Envelope{
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{Filename: "missing-external-id.pdf"}),
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{ExternalId: "pipe-should-not-run", Filename: "skipped.pdf"}),
+		},
+	})
+
+	var pipeResp pb.PipelineResponse
+	mustUnmarshal(t, resp.Payload, &pipeResp)
+	if len(pipeResp.Responses) != 1 {
+		t.Fatalf("Expected pipeline to stop after first failure, got %d responses", len(pipeResp.Responses))
+	}
+	assertServerErrorContains(t, pipeResp.Responses[0], "document external_id is required")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.DocumentCount != 0 {
+		t.Fatalf("Expected later command not to execute, got %d documents", info.DocumentCount)
+	}
+}
+
+func TestServerIntegration_PipelineStopsOnMidPipelineFailureWithoutRollback(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp := mustSendCommand(t, conn, pb.CommandType_CMD_PIPELINE, &pb.PipelineRequest{
+		Commands: []*pb.Envelope{
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{ExternalId: "pipe-committed", Filename: "committed.pdf"}),
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{Filename: "missing-external-id.pdf"}),
+			pipelineCommand(pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{ExternalId: "pipe-skipped", Filename: "skipped.pdf"}),
+		},
+	})
+
+	var pipeResp pb.PipelineResponse
+	mustUnmarshal(t, resp.Payload, &pipeResp)
+	if len(pipeResp.Responses) != 2 {
+		t.Fatalf("Expected pipeline to stop after mid failure, got %d responses", len(pipeResp.Responses))
+	}
+	if pipeResp.Responses[0].CmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, pipeResp.Responses[0].Payload, &errResp)
+		t.Fatalf("First pipeline command should have committed: %s", errResp.Message)
+	}
+	assertServerErrorContains(t, pipeResp.Responses[1], "document external_id is required")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.DocumentCount != 1 {
+		t.Fatalf("Expected first command committed and later command skipped, got %d documents", info.DocumentCount)
 	}
 }
 
@@ -1911,6 +3060,37 @@ func TestServerIntegration_MSetEntities(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_MSetEntitiesRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_MSET_ENTITIES, &pb.MSetEntitiesRequest{
+		Entities: []*pb.AddEntityRequest{
+			{ExternalId: "bulk-ent-valid", Title: "Bulk Entity Valid", Type: "test"},
+			{Title: "Bulk Entity Missing External ID", Type: "test"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet entities failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "atomic bulk entities failed at index 1")
+	assertServerErrorContains(t, resp, "no items committed")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.EntityCount != 0 {
+		t.Fatalf("Expected no entities after atomic bulk failure, got %d", info.EntityCount)
+	}
+}
+
 func TestServerIntegration_MGetEntities(t *testing.T) {
 	srv, addr := createTestServer(t)
 	defer srv.Stop()
@@ -2059,6 +3239,37 @@ func TestServerIntegration_MSetDocuments(t *testing.T) {
 	}
 }
 
+func TestServerIntegration_MSetDocumentsRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_MSET_DOCUMENTS, &pb.MSetDocumentsRequest{
+		Documents: []*pb.AddDocumentRequest{
+			{ExternalId: "bulk-doc-valid", Filename: "doc1.pdf"},
+			{Filename: "missing-external-id.pdf"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet documents failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "atomic bulk documents failed at index 1")
+	assertServerErrorContains(t, resp, "no items committed")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.DocumentCount != 0 {
+		t.Fatalf("Expected no documents after atomic bulk failure, got %d", info.DocumentCount)
+	}
+}
+
 func TestServerIntegration_MGetDocuments(t *testing.T) {
 	srv, addr := createTestServer(t)
 	defer srv.Stop()
@@ -2139,6 +3350,44 @@ func TestServerIntegration_MSetTextUnits(t *testing.T) {
 		var errResp pb.Error
 		mustUnmarshal(t, resp.Payload, &errResp)
 		t.Fatalf("MSet text units returned error: %s", errResp.Message)
+	}
+}
+
+func TestServerIntegration_MSetTextUnitsRequiresExternalID(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	docResp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_DOCUMENT, &pb.AddDocumentRequest{
+		ExternalId: "mset-tu-missing-external-id-doc",
+		Filename:   "mset_tu.pdf",
+	})
+	var docID pb.OkWithID
+	mustUnmarshal(t, docResp.Payload, &docID)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_MSET_TEXTUNITS, &pb.MSetTextUnitsRequest{
+		Textunits: []*pb.AddTextUnitRequest{
+			{ExternalId: "bulk-tu-valid", DocumentId: docID.Id, Content: "Content 1", Embedding: make([]float32, testVectorDim), TokenCount: 5},
+			{DocumentId: docID.Id, Content: "Content 2", Embedding: make([]float32, testVectorDim), TokenCount: 5},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet text units failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "atomic bulk textunits failed at index 1")
+	assertServerErrorContains(t, resp, "no items committed")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.TextunitCount != 0 {
+		t.Fatalf("Expected no text units after atomic bulk failure, got %d", info.TextunitCount)
 	}
 }
 
@@ -2249,6 +3498,56 @@ func TestServerIntegration_MSetRelationships(t *testing.T) {
 		var errResp pb.Error
 		mustUnmarshal(t, resp.Payload, &errResp)
 		t.Fatalf("MSet relationships returned error: %s", errResp.Message)
+	}
+}
+
+func TestServerIntegration_MSetRelationshipsAtomicInvalidMiddle(t *testing.T) {
+	srv, addr := createTestServer(t)
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer closeSilently(conn)
+
+	embedding := make([]float32, testVectorDim)
+	ent1Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "mset-rel-atomic-ent1",
+		Title:      "MSet Rel Atomic Entity 1",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var ent1ID pb.OkWithID
+	mustUnmarshal(t, ent1Resp.Payload, &ent1ID)
+
+	ent2Resp := mustSendCommand(t, conn, pb.CommandType_CMD_ADD_ENTITY, &pb.AddEntityRequest{
+		ExternalId: "mset-rel-atomic-ent2",
+		Title:      "MSet Rel Atomic Entity 2",
+		Type:       "test",
+		Embedding:  embedding,
+	})
+	var ent2ID pb.OkWithID
+	mustUnmarshal(t, ent2Resp.Payload, &ent2ID)
+
+	resp, err := sendCommand(conn, pb.CommandType_CMD_MSET_RELATIONSHIPS, &pb.MSetRelationshipsRequest{
+		Relationships: []*pb.AddRelationshipRequest{
+			{ExternalId: "bulk-rel-valid", SourceId: ent1ID.Id, TargetId: ent2ID.Id, Type: "RELATED", Description: "Desc", Weight: 1.0},
+			{ExternalId: "bulk-rel-invalid", SourceId: ent1ID.Id, TargetId: 999, Type: "RELATED", Description: "Desc", Weight: 1.0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("MSet relationships failed: %v", err)
+	}
+
+	assertServerErrorContains(t, resp, "atomic bulk relationships failed at index 1")
+	assertServerErrorContains(t, resp, "no items committed")
+
+	infoResp := mustSendCommand(t, conn, pb.CommandType_CMD_INFO, nil)
+	var info pb.InfoResponse
+	mustUnmarshal(t, infoResp.Payload, &info)
+	if info.RelationshipCount != 0 {
+		t.Fatalf("Expected no relationships after atomic bulk failure, got %d", info.RelationshipCount)
 	}
 }
 
@@ -3033,6 +4332,70 @@ func TestServerIntegration_BGRestoreWithCallback(t *testing.T) {
 
 	// Wait for background restore to complete
 	wg.Wait()
+}
+
+func TestSaveValidatesPathWithinConfiguredDataDir(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Server.DataDir = dataDir
+	srv := NewServerWithConfig(engine.NewEngine(testVectorDim), cfg)
+
+	var capturedPath string
+	srv.SetSnapshotCallback(func(path string) error {
+		capturedPath = path
+		return nil
+	})
+
+	savePath := filepath.Join(dataDir, "snapshot.gibram")
+	cmdType, payload := srv.handleSave(mustMarshal(&pb.SaveRequest{Path: savePath}))
+	if cmdType == pb.CommandType_CMD_ERROR {
+		var errResp pb.Error
+		mustUnmarshal(t, payload, &errResp)
+		t.Fatalf("expected valid save path, got error: %s", errResp.Message)
+	}
+	if capturedPath != savePath {
+		t.Fatalf("expected snapshot callback path %q, got %q", savePath, capturedPath)
+	}
+}
+
+func TestSaveRejectsTraversalOutsideConfiguredDataDir(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Server.DataDir = dataDir
+	srv := NewServerWithConfig(engine.NewEngine(testVectorDim), cfg)
+
+	called := false
+	srv.SetSnapshotCallback(func(path string) error {
+		called = true
+		return nil
+	})
+
+	escapePath := filepath.Join(dataDir, "..", "outside.gibram")
+	cmdType, payload := srv.handleSave(mustMarshal(&pb.SaveRequest{Path: escapePath}))
+	assertServerErrorContains(t, &pb.Envelope{CmdType: cmdType, Payload: payload}, "path escapes base directory")
+	if called {
+		t.Fatal("snapshot callback should not be called for rejected path")
+	}
+}
+
+func TestBGRestoreRejectsPathOutsideConfiguredDataDir(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Server.DataDir = dataDir
+	srv := NewServerWithConfig(engine.NewEngine(testVectorDim), cfg)
+
+	called := false
+	srv.SetRestoreCallback(func(path string) error {
+		called = true
+		return nil
+	})
+
+	restorePath := filepath.Join(dataDir, "..", "restore.gibram")
+	cmdType, payload := srv.handleBGRestore(mustMarshal(&pb.RestoreRequest{Path: restorePath}))
+	assertServerErrorContains(t, &pb.Envelope{CmdType: cmdType, Payload: payload}, "path escapes base directory")
+	if called {
+		t.Fatal("restore callback should not be called for rejected path")
+	}
 }
 
 func TestServerIntegration_BGSaveAlreadyInProgress(t *testing.T) {

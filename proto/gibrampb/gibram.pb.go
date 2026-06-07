@@ -515,7 +515,10 @@ type InfoResponse struct {
 	RelationshipCount uint64                 `protobuf:"varint,5,opt,name=relationship_count,json=relationshipCount,proto3" json:"relationship_count,omitempty"`
 	CommunityCount    uint64                 `protobuf:"varint,6,opt,name=community_count,json=communityCount,proto3" json:"community_count,omitempty"`
 	VectorDim         int32                  `protobuf:"varint,7,opt,name=vector_dim,json=vectorDim,proto3" json:"vector_dim,omitempty"`
-	SessionCount      int32                  `protobuf:"varint,8,opt,name=session_count,json=sessionCount,proto3" json:"session_count,omitempty"` // number of active sessions
+	SessionCount      int32                  `protobuf:"varint,8,opt,name=session_count,json=sessionCount,proto3" json:"session_count,omitempty"`              // number of active sessions
+	SessionStoreMode  string                 `protobuf:"bytes,9,opt,name=session_store_mode,json=sessionStoreMode,proto3" json:"session_store_mode,omitempty"` // ephemeral, durable
+	WalSyncPolicy     string                 `protobuf:"bytes,10,opt,name=wal_sync_policy,json=walSyncPolicy,proto3" json:"wal_sync_policy,omitempty"`         // every_write, periodic, never
+	WalSyncIntervalMs int64                  `protobuf:"varint,11,opt,name=wal_sync_interval_ms,json=walSyncIntervalMs,proto3" json:"wal_sync_interval_ms,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -602,6 +605,27 @@ func (x *InfoResponse) GetVectorDim() int32 {
 func (x *InfoResponse) GetSessionCount() int32 {
 	if x != nil {
 		return x.SessionCount
+	}
+	return 0
+}
+
+func (x *InfoResponse) GetSessionStoreMode() string {
+	if x != nil {
+		return x.SessionStoreMode
+	}
+	return ""
+}
+
+func (x *InfoResponse) GetWalSyncPolicy() string {
+	if x != nil {
+		return x.WalSyncPolicy
+	}
+	return ""
+}
+
+func (x *InfoResponse) GetWalSyncIntervalMs() int64 {
+	if x != nil {
+		return x.WalSyncIntervalMs
 	}
 	return 0
 }
@@ -2431,12 +2455,13 @@ func (x *RelationshipResult) GetTargetTitle() string {
 }
 
 type QueryStats struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	DurationMicros  int64                  `protobuf:"varint,1,opt,name=duration_micros,json=durationMicros,proto3" json:"duration_micros,omitempty"`
-	VectorSearches  int32                  `protobuf:"varint,2,opt,name=vector_searches,json=vectorSearches,proto3" json:"vector_searches,omitempty"`
-	GraphTraversals int32                  `protobuf:"varint,3,opt,name=graph_traversals,json=graphTraversals,proto3" json:"graph_traversals,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	DurationMicros     int64                  `protobuf:"varint,1,opt,name=duration_micros,json=durationMicros,proto3" json:"duration_micros,omitempty"`
+	VectorSearches     int32                  `protobuf:"varint,2,opt,name=vector_searches,json=vectorSearches,proto3" json:"vector_searches,omitempty"`
+	GraphTraversals    int32                  `protobuf:"varint,3,opt,name=graph_traversals,json=graphTraversals,proto3" json:"graph_traversals,omitempty"`
+	SkippedSeedIndexes []string               `protobuf:"bytes,4,rep,name=skipped_seed_indexes,json=skippedSeedIndexes,proto3" json:"skipped_seed_indexes,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *QueryStats) Reset() {
@@ -2488,6 +2513,13 @@ func (x *QueryStats) GetGraphTraversals() int32 {
 		return x.GraphTraversals
 	}
 	return 0
+}
+
+func (x *QueryStats) GetSkippedSeedIndexes() []string {
+	if x != nil {
+		return x.SkippedSeedIndexes
+	}
+	return nil
 }
 
 type QueryResponse struct {
@@ -4316,7 +4348,7 @@ const file_proto_gibram_proto_rawDesc = "" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\x05R\x04code\"\x1a\n" +
 	"\bOkWithID\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x04R\x02id\"\xb5\x02\n" +
+	"\x02id\x18\x01 \x01(\x04R\x02id\"\xbc\x03\n" +
 	"\fInfoResponse\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12%\n" +
 	"\x0edocument_count\x18\x02 \x01(\x04R\rdocumentCount\x12%\n" +
@@ -4326,7 +4358,11 @@ const file_proto_gibram_proto_rawDesc = "" +
 	"\x0fcommunity_count\x18\x06 \x01(\x04R\x0ecommunityCount\x12\x1d\n" +
 	"\n" +
 	"vector_dim\x18\a \x01(\x05R\tvectorDim\x12#\n" +
-	"\rsession_count\x18\b \x01(\x05R\fsessionCount\"\xe2\x02\n" +
+	"\rsession_count\x18\b \x01(\x05R\fsessionCount\x12,\n" +
+	"\x12session_store_mode\x18\t \x01(\tR\x10sessionStoreMode\x12&\n" +
+	"\x0fwal_sync_policy\x18\n" +
+	" \x01(\tR\rwalSyncPolicy\x12/\n" +
+	"\x14wal_sync_interval_ms\x18\v \x01(\x03R\x11walSyncIntervalMs\"\xe2\x02\n" +
 	"\vSessionInfo\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1d\n" +
@@ -4505,12 +4541,13 @@ const file_proto_gibram_proto_rawDesc = "" +
 	"\x12RelationshipResult\x12;\n" +
 	"\frelationship\x18\x01 \x01(\v2\x17.gibram.v1.RelationshipR\frelationship\x12!\n" +
 	"\fsource_title\x18\x02 \x01(\tR\vsourceTitle\x12!\n" +
-	"\ftarget_title\x18\x03 \x01(\tR\vtargetTitle\"\x89\x01\n" +
+	"\ftarget_title\x18\x03 \x01(\tR\vtargetTitle\"\xbb\x01\n" +
 	"\n" +
 	"QueryStats\x12'\n" +
 	"\x0fduration_micros\x18\x01 \x01(\x03R\x0edurationMicros\x12'\n" +
 	"\x0fvector_searches\x18\x02 \x01(\x05R\x0evectorSearches\x12)\n" +
-	"\x10graph_traversals\x18\x03 \x01(\x05R\x0fgraphTraversals\"\xc8\x02\n" +
+	"\x10graph_traversals\x18\x03 \x01(\x05R\x0fgraphTraversals\x120\n" +
+	"\x14skipped_seed_indexes\x18\x04 \x03(\tR\x12skippedSeedIndexes\"\xc8\x02\n" +
 	"\rQueryResponse\x12\x19\n" +
 	"\bquery_id\x18\x01 \x01(\x04R\aqueryId\x127\n" +
 	"\ttextunits\x18\x02 \x03(\v2\x19.gibram.v1.TextUnitResultR\ttextunits\x123\n" +

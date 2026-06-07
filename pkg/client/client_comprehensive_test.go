@@ -319,6 +319,69 @@ func TestClient_Info(t *testing.T) {
 	if info.Version == "" {
 		t.Error("Version should not be empty")
 	}
+	if info.SessionStoreMode != "ephemeral" {
+		t.Errorf("SessionStoreMode = %q, want ephemeral", info.SessionStoreMode)
+	}
+	if info.WALSyncPolicy != "every_write" || info.WALSyncIntervalMS != 1000 {
+		t.Errorf("ephemeral INFO did not map server WAL defaults, got %+v", info)
+	}
+}
+
+func TestClient_InfoMapsDurableSessionStoreMetadata(t *testing.T) {
+	root := t.TempDir()
+	eng, err := engine.NewEngineWithOptions(engine.Options{
+		VectorDim: 64,
+		StoreMode: "durable",
+		Durable: engine.DurableOptions{
+			WALDir:       root,
+			SyncPolicy:   "periodic",
+			SyncInterval: 250 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create durable engine: %v", err)
+	}
+	defer eng.Close()
+	srv := server.NewServer(eng)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find available port: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close temporary listener: %v", err)
+	}
+	if err := srv.Start(addr); err != nil {
+		t.Fatalf("start durable test server: %v", err)
+	}
+	defer srv.Stop()
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := NewClient(addr, testSessionID)
+	if err != nil {
+		t.Fatalf("create durable client: %v", err)
+	}
+	defer closeClient(t, client)
+	if _, err := client.AddDocument("durable-info-doc", "durable.txt"); err != nil {
+		t.Fatalf("create durable session data: %v", err)
+	}
+
+	info, err := client.Info()
+	if err != nil {
+		t.Fatalf("Info failed: %v", err)
+	}
+	if info.SessionCount != 1 {
+		t.Errorf("SessionCount = %d, want 1", info.SessionCount)
+	}
+	if info.SessionStoreMode != "durable" {
+		t.Errorf("SessionStoreMode = %q, want durable", info.SessionStoreMode)
+	}
+	if info.WALSyncPolicy != "periodic" {
+		t.Errorf("WALSyncPolicy = %q, want periodic", info.WALSyncPolicy)
+	}
+	if info.WALSyncIntervalMS != 250 {
+		t.Errorf("WALSyncIntervalMS = %d, want 250", info.WALSyncIntervalMS)
+	}
 }
 
 // =============================================================================

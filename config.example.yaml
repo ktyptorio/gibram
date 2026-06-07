@@ -17,33 +17,39 @@ tls:
   cert_file: ""  # Path to certificate file (e.g., /etc/gibram/certs/server.crt)
   key_file: ""   # Path to private key file (e.g., /etc/gibram/certs/server.key)
   
-  # DEVELOPMENT ONLY: Auto-generate self-signed certificate
-  # WARNING: Not secure for production! Clients must skip certificate verification.
-  auto_cert: true
+  # DEVELOPMENT ONLY: Auto-generate self-signed certificate.
+  # Keep false for production; provide cert_file/key_file instead.
+  auto_cert: false
   
   # INSECURE MODE (DEV ONLY): Start server with --insecure flag to disable TLS entirely
   # DO NOT USE IN PRODUCTION
 
 auth:
   keys:
-    # Admin key - full access
+    # Admin key - full access.
+    # Use bcrypt key_hash in production. Do not store plaintext API keys.
     - id: "admin"
-      key: "gibram_admin_change_me_in_production"
+      key_hash: "$2a$12$replace_with_bcrypt_hash_for_admin_key"
       permissions: ["admin"]
     
     # Application key - read/write access
     - id: "app-service"
-      key: "gibram_app_change_me_in_production"
+      key_hash: "$2a$12$replace_with_bcrypt_hash_for_app_key"
       permissions: ["write"]
     
     # Read-only key
     - id: "query-service"
-      key: "gibram_query_change_me_in_production"
+      key_hash: "$2a$12$replace_with_bcrypt_hash_for_query_key"
       permissions: ["read"]
 
 security:
   # Max frame size (4MB default)
   max_frame_size: 4194304
+  max_content_bytes: 1048576
+  max_memory_bytes: 0
+  max_session_documents: 0
+  max_session_entities: 0
+  max_session_relationships: 0
   
   # Rate limiting per API key
   rate_limit: 1000  # requests per second

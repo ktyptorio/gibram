@@ -40,24 +40,43 @@ func ValidatePath(basePath, targetPath string) (string, error) {
 		return "", fmt.Errorf("path escapes base directory: %s", targetPath)
 	}
 
-	// Check for symlink attacks by evaluating the real path
 	realBase, err := filepath.EvalSymlinks(absBase)
 	if err != nil && !os.IsNotExist(err) {
-		// Base must exist or be creatable
+		return "", fmt.Errorf("resolve base path: %w", err)
+	}
+	if os.IsNotExist(err) {
 		realBase = absBase
 	}
 
 	realTarget, err := filepath.EvalSymlinks(absTarget)
-	if err != nil && !os.IsNotExist(err) {
-		// Target might not exist yet, use parent
-		realTarget = absTarget
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolve target path: %w", err)
+		}
+		existingParent := filepath.Dir(absTarget)
+		missingSuffix := filepath.Base(absTarget)
+		for {
+			realParent, parentErr := filepath.EvalSymlinks(existingParent)
+			if parentErr == nil {
+				realTarget = filepath.Join(realParent, missingSuffix)
+				break
+			}
+			if !os.IsNotExist(parentErr) {
+				return "", fmt.Errorf("resolve target parent: %w", parentErr)
+			}
+			nextParent := filepath.Dir(existingParent)
+			if nextParent == existingParent {
+				realTarget = absTarget
+				break
+			}
+			missingSuffix = filepath.Join(filepath.Base(existingParent), missingSuffix)
+			existingParent = nextParent
+		}
 	}
 
 	// Verify the real paths still maintain containment
-	if realBase != absBase || realTarget != absTarget {
-		if !strings.HasPrefix(realTarget, realBase+string(filepath.Separator)) && realTarget != realBase {
-			return "", fmt.Errorf("symlink escapes base directory")
-		}
+	if !strings.HasPrefix(realTarget, realBase+string(filepath.Separator)) && realTarget != realBase {
+		return "", fmt.Errorf("symlink escapes base directory")
 	}
 
 	return absTarget, nil
@@ -104,11 +123,12 @@ func SanitizeDataDir(dataDir string) (string, error) {
 
 // Config is the main configuration structure
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	TLS      TLSConfig      `yaml:"tls"`
-	Auth     AuthConfig     `yaml:"auth"`
-	Security SecurityConfig `yaml:"security"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	Server       ServerConfig       `yaml:"server"`
+	SessionStore SessionStoreConfig `yaml:"session_store"`
+	TLS          TLSConfig          `yaml:"tls"`
+	Auth         AuthConfig         `yaml:"auth"`
+	Security     SecurityConfig     `yaml:"security"`
+	Logging      LoggingConfig      `yaml:"logging"`
 }
 
 // ServerConfig contains server settings
@@ -116,6 +136,17 @@ type ServerConfig struct {
 	Addr      string `yaml:"addr"`
 	DataDir   string `yaml:"data_dir"`
 	VectorDim int    `yaml:"vector_dim"`
+}
+
+// SessionStoreConfig contains session store durability settings.
+type SessionStoreConfig struct {
+	Mode                 string        `yaml:"mode"`                    // ephemeral, durable
+	WALDir               string        `yaml:"wal_dir"`                 // optional; defaults under data_dir
+	WALSyncPolicy        string        `yaml:"wal_sync_policy"`         // every_write, periodic, never
+	WALSyncInterval      time.Duration `yaml:"wal_sync_interval"`       // used by periodic policy
+	SnapshotDir          string        `yaml:"snapshot_dir"`            // optional; defaults under data_dir
+	SnapshotInterval     time.Duration `yaml:"snapshot_interval"`       // 0 disables interval snapshots
+	SnapshotWALSizeBytes int64         `yaml:"snapshot_wal_size_bytes"` // 0 disables WAL-growth snapshots
 }
 
 // TLSConfig contains TLS settings
@@ -133,20 +164,25 @@ type AuthConfig struct {
 // APIKeyConfig represents an API key
 type APIKeyConfig struct {
 	ID          string   `yaml:"id"`
-	Key         string   `yaml:"key"`          // Plain text in config
-	KeyHash     string   `yaml:"key_hash"`     // Or bcrypt hash (if Key is empty)
-	Permissions []string `yaml:"permissions"`  // admin, write, read
-	ExpiresAt   string   `yaml:"expires_at"`   // Optional: RFC3339 format
+	Key         string   `yaml:"key"`         // Plain text in config
+	KeyHash     string   `yaml:"key_hash"`    // Or bcrypt hash (if Key is empty)
+	Permissions []string `yaml:"permissions"` // admin, write, read
+	ExpiresAt   string   `yaml:"expires_at"`  // Optional: RFC3339 format
 }
 
 // SecurityConfig contains security settings
 type SecurityConfig struct {
-	MaxFrameSize   int           `yaml:"max_frame_size"`   // Max frame size in bytes
-	RateLimit      int           `yaml:"rate_limit"`       // Requests per second per key
-	RateBurst      int           `yaml:"rate_burst"`       // Burst allowance
-	IdleTimeout    time.Duration `yaml:"idle_timeout"`     // Idle connection timeout
-	UnauthTimeout  time.Duration `yaml:"unauth_timeout"`   // Timeout for unauthenticated
-	MaxConnsPerIP  int           `yaml:"max_conns_per_ip"` // Max connections per IP
+	MaxFrameSize            int           `yaml:"max_frame_size"`    // Max frame size in bytes
+	MaxContentBytes         int           `yaml:"max_content_bytes"` // Max text content per write
+	MaxMemoryBytes          int64         `yaml:"max_memory_bytes"`  // Max admitted session memory bytes
+	MaxSessionDocuments     int           `yaml:"max_session_documents"`
+	MaxSessionEntities      int           `yaml:"max_session_entities"`
+	MaxSessionRelationships int           `yaml:"max_session_relationships"`
+	RateLimit               int           `yaml:"rate_limit"`       // Requests per second per key
+	RateBurst               int           `yaml:"rate_burst"`       // Burst allowance
+	IdleTimeout             time.Duration `yaml:"idle_timeout"`     // Idle connection timeout
+	UnauthTimeout           time.Duration `yaml:"unauth_timeout"`   // Timeout for unauthenticated
+	MaxConnsPerIP           int           `yaml:"max_conns_per_ip"` // Max connections per IP
 }
 
 // LoggingConfig contains logging settings
@@ -169,6 +205,11 @@ func DefaultConfig() *Config {
 			DataDir:   "./data",
 			VectorDim: 1536,
 		},
+		SessionStore: SessionStoreConfig{
+			Mode:            "ephemeral",
+			WALSyncPolicy:   "every_write",
+			WALSyncInterval: time.Second,
+		},
 		TLS: TLSConfig{
 			CertFile: "",
 			KeyFile:  "",
@@ -178,12 +219,17 @@ func DefaultConfig() *Config {
 			Keys: []APIKeyConfig{},
 		},
 		Security: SecurityConfig{
-			MaxFrameSize:   4 * 1024 * 1024, // 4MB
-			RateLimit:      1000,            // 1000 req/s
-			RateBurst:      100,
-			IdleTimeout:    300 * time.Second,
-			UnauthTimeout:  10 * time.Second,
-			MaxConnsPerIP:  50,
+			MaxFrameSize:            4 * 1024 * 1024, // 4MB
+			MaxContentBytes:         1 * 1024 * 1024, // 1MB text fields
+			MaxMemoryBytes:          0,
+			MaxSessionDocuments:     0,
+			MaxSessionEntities:      0,
+			MaxSessionRelationships: 0,
+			RateLimit:               1000, // 1000 req/s
+			RateBurst:               100,
+			IdleTimeout:             300 * time.Second,
+			UnauthTimeout:           10 * time.Second,
+			MaxConnsPerIP:           50,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -218,6 +264,10 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	cfg.Server.DataDir = sanitizedDir
 
+	if err := cfg.NormalizeSessionStore(); err != nil {
+		return nil, err
+	}
+
 	// Process API keys - hash plain text keys
 	for i := range cfg.Auth.Keys {
 		key := &cfg.Auth.Keys[i]
@@ -233,6 +283,42 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// NormalizeSessionStore validates session store configuration and fills durable defaults.
+func (cfg *Config) NormalizeSessionStore() error {
+	mode := strings.ToLower(strings.TrimSpace(cfg.SessionStore.Mode))
+	if mode == "" {
+		mode = "ephemeral"
+	}
+	switch mode {
+	case "ephemeral", "durable":
+		cfg.SessionStore.Mode = mode
+	default:
+		return fmt.Errorf("invalid session_store.mode %q: expected ephemeral or durable", cfg.SessionStore.Mode)
+	}
+
+	policy := strings.ToLower(strings.TrimSpace(cfg.SessionStore.WALSyncPolicy))
+	if policy == "" {
+		policy = "every_write"
+	}
+	switch policy {
+	case "every_write", "periodic", "never":
+		cfg.SessionStore.WALSyncPolicy = policy
+	default:
+		return fmt.Errorf("invalid session_store.wal_sync_policy %q: expected every_write, periodic, or never", cfg.SessionStore.WALSyncPolicy)
+	}
+
+	if cfg.SessionStore.WALSyncInterval <= 0 {
+		cfg.SessionStore.WALSyncInterval = time.Second
+	}
+	if cfg.SessionStore.Mode == "durable" && cfg.SessionStore.WALDir == "" {
+		cfg.SessionStore.WALDir = filepath.Join(cfg.Server.DataDir, "session_wal")
+	}
+	if cfg.SessionStore.Mode == "durable" && cfg.SessionStore.SnapshotDir == "" {
+		cfg.SessionStore.SnapshotDir = filepath.Join(cfg.Server.DataDir, "session_snapshots")
+	}
+	return nil
 }
 
 // SaveConfig saves configuration to a YAML file
@@ -389,6 +475,9 @@ func (cfg *Config) ApplyOverrides(overrides CLIOverrides) {
 	}
 	if overrides.LogLevel != "" {
 		cfg.Logging.Level = overrides.LogLevel
+	}
+	if cfg.SessionStore.Mode == "" {
+		cfg.SessionStore.Mode = "ephemeral"
 	}
 }
 

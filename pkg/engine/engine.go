@@ -23,9 +23,11 @@ import (
 // =============================================================================
 
 var (
-	ErrSessionRequired = errors.New("session_id is required")
-	ErrSessionNotFound = errors.New("session not found")
-	ErrSessionExpired  = errors.New("session expired")
+	ErrSessionRequired   = errors.New("session_id is required")
+	ErrSessionNotFound   = errors.New("session not found")
+	ErrSessionExpired    = errors.New("session expired")
+	ErrRetrievalNotReady = errors.New("retrieval ready error")
+	ErrDurableRecovery   = errors.New("durable recovery failed")
 )
 
 // =============================================================================
@@ -140,12 +142,19 @@ type Engine struct {
 	queryLogs *queryLogLRU
 
 	// Config
-	vectorDim int
+	vectorDim      int
+	storeMode      string
+	walPolicy      string
+	walInterval    time.Duration
+	resourceLimits ResourceLimits
 
 	// Session cleanup
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	cleanupWg       sync.WaitGroup
+
+	durable *durableSessionStore
+	healthy atomic.Bool
 }
 
 type queryLog struct {
@@ -157,15 +166,100 @@ type queryLog struct {
 
 // NewEngine creates a new session-based GibRAM engine
 func NewEngine(vectorDim int) *Engine {
+	e, err := NewEngineWithOptions(Options{VectorDim: vectorDim})
+	if err != nil {
+		panic(err)
+	}
+	return e
+}
+
+// Options configures a session-based GibRAM engine.
+type Options struct {
+	VectorDim      int
+	StoreMode      string
+	Durable        DurableOptions
+	ResourceLimits ResourceLimits
+}
+
+type ResourceLimits struct {
+	MaxDocuments     int
+	MaxEntities      int
+	MaxRelationships int
+	MaxMemoryBytes   int64
+}
+
+// DurableOptions configures the optional Durable Session Store.
+type DurableOptions struct {
+	WALDir               string
+	SnapshotDir          string
+	SyncPolicy           string
+	SyncInterval         time.Duration
+	SnapshotInterval     time.Duration
+	SnapshotWALSizeBytes int64
+}
+
+// NewEngineWithOptions creates a new engine with explicit session store mode.
+func NewEngineWithOptions(opts Options) (*Engine, error) {
+	if opts.VectorDim <= 0 {
+		opts.VectorDim = 1536
+	}
+	mode := opts.StoreMode
+	if mode == "" {
+		mode = "ephemeral"
+	}
+	policy := opts.Durable.SyncPolicy
+	if policy == "" {
+		policy = "every_write"
+	}
+	interval := opts.Durable.SyncInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+
 	e := &Engine{
 		sessions:        make(map[string]*store.SessionStore),
 		queryLogs:       newQueryLogLRU(MaxQueryLogEntries),
-		vectorDim:       vectorDim,
+		vectorDim:       opts.VectorDim,
+		storeMode:       mode,
+		walPolicy:       policy,
+		walInterval:     interval,
+		resourceLimits:  opts.ResourceLimits,
 		cleanupInterval: 60 * time.Second,
 		stopCleanup:     make(chan struct{}),
 	}
+	e.healthy.Store(true)
 
-	return e
+	if mode == "durable" {
+		durable, err := openDurableSessionStore(DurableOptions{
+			WALDir:               opts.Durable.WALDir,
+			SnapshotDir:          opts.Durable.SnapshotDir,
+			SyncPolicy:           policy,
+			SyncInterval:         interval,
+			SnapshotInterval:     opts.Durable.SnapshotInterval,
+			SnapshotWALSizeBytes: opts.Durable.SnapshotWALSizeBytes,
+		})
+		if err != nil {
+			return nil, err
+		}
+		durable.markUnhealthy = e.markUnhealthy
+		e.durable = durable
+		recoveryStarted := time.Now()
+		if err := e.restoreLatestDurableSnapshot(); err != nil {
+			if closeErr := durable.wal.Close(); closeErr != nil {
+				return nil, fmt.Errorf("%w: %v (close failed: %v)", ErrDurableRecovery, err, closeErr)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrDurableRecovery, err)
+		}
+		if err := e.recoverDurableSessions(); err != nil {
+			if closeErr := durable.wal.Close(); closeErr != nil {
+				return nil, fmt.Errorf("%w: %v (close failed: %v)", ErrDurableRecovery, err, closeErr)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrDurableRecovery, err)
+		}
+		durable.recoveryDuration = time.Since(recoveryStarted)
+	}
+
+	return e, nil
 }
 
 // =============================================================================
@@ -198,8 +292,15 @@ func (e *Engine) getOrCreateSession(sessionID string) (*store.SessionStore, erro
 
 	// Create new session (auto-create on first write)
 	sess := store.NewSessionStore(sessionID, e.vectorDim)
+	e.applyResourceLimits(sess)
 	e.sessions[sessionID] = sess
 	return sess, nil
+}
+
+func (e *Engine) applyResourceLimits(sess *store.SessionStore) {
+	if e.resourceLimits.MaxDocuments > 0 || e.resourceLimits.MaxEntities > 0 || e.resourceLimits.MaxRelationships > 0 || e.resourceLimits.MaxMemoryBytes > 0 {
+		sess.SetQuotas(e.resourceLimits.MaxEntities, e.resourceLimits.MaxRelationships, e.resourceLimits.MaxDocuments, e.resourceLimits.MaxMemoryBytes)
+	}
 }
 
 // getSession gets an existing session (does not auto-create)
@@ -358,6 +459,13 @@ func (e *Engine) AddDocument(sessionID, extID, filename string) (*types.Document
 	if err != nil {
 		return nil, err
 	}
+	if d := e.durableSession(); d != nil {
+		doc, err := durableAddDocument(sess, sessionID, d, extID, filename)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return doc, err
+	}
 	return sess.AddDocument(extID, filename)
 }
 
@@ -370,11 +478,22 @@ func (e *Engine) GetDocument(sessionID string, id uint64) (*types.Document, bool
 }
 
 func (e *Engine) DeleteDocument(sessionID string, id uint64) bool {
+	return e.DeleteDocumentChecked(sessionID, id) == nil
+}
+
+func (e *Engine) DeleteDocumentChecked(sessionID string, id uint64) error {
 	sess, err := e.getSession(sessionID)
 	if err != nil {
-		return false
+		return err
 	}
-	return sess.DeleteDocument(id)
+	if d := e.durableSession(); d != nil {
+		err := durableDelete(sess, sessionID, d, walOpDeleteDocument, id, sess.ValidateDeleteDocument, sess.DeleteDocumentChecked)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return err
+	}
+	return sess.DeleteDocumentChecked(id)
 }
 
 func (e *Engine) UpdateDocumentStatus(sessionID string, id uint64, status types.DocumentStatus) bool {
@@ -399,6 +518,13 @@ func (e *Engine) AddTextUnit(sessionID, extID string, docID uint64, content stri
 	if err != nil {
 		return nil, err
 	}
+	if d := e.durableSession(); d != nil {
+		tu, err := durableAddTextUnit(sess, sessionID, d, extID, docID, content, embedding, tokenCount)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return tu, err
+	}
 	return sess.AddTextUnit(extID, docID, content, embedding, tokenCount)
 }
 
@@ -411,11 +537,22 @@ func (e *Engine) GetTextUnit(sessionID string, id uint64) (*types.TextUnit, bool
 }
 
 func (e *Engine) DeleteTextUnit(sessionID string, id uint64) bool {
+	return e.DeleteTextUnitChecked(sessionID, id) == nil
+}
+
+func (e *Engine) DeleteTextUnitChecked(sessionID string, id uint64) error {
 	sess, err := e.getSession(sessionID)
 	if err != nil {
-		return false
+		return err
 	}
-	return sess.DeleteTextUnit(id)
+	if d := e.durableSession(); d != nil {
+		err := durableDelete(sess, sessionID, d, walOpDeleteTextUnit, id, sess.ValidateDeleteTextUnit, sess.DeleteTextUnitChecked)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return err
+	}
+	return sess.DeleteTextUnitChecked(id)
 }
 
 func (e *Engine) LinkTextUnitToEntity(sessionID string, tuID, entityID uint64) bool {
@@ -434,6 +571,13 @@ func (e *Engine) AddEntity(sessionID, extID, title, entType, description string,
 	sess, err := e.getOrCreateSession(sessionID)
 	if err != nil {
 		return nil, err
+	}
+	if d := e.durableSession(); d != nil {
+		ent, err := durableAddEntity(sess, sessionID, d, extID, title, entType, description, embedding)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return ent, err
 	}
 	return sess.AddEntity(extID, title, entType, description, embedding)
 }
@@ -463,11 +607,22 @@ func (e *Engine) UpdateEntityDescription(sessionID string, id uint64, descriptio
 }
 
 func (e *Engine) DeleteEntity(sessionID string, id uint64) bool {
+	return e.DeleteEntityChecked(sessionID, id) == nil
+}
+
+func (e *Engine) DeleteEntityChecked(sessionID string, id uint64) error {
 	sess, err := e.getSession(sessionID)
 	if err != nil {
-		return false
+		return err
 	}
-	return sess.DeleteEntity(id)
+	if d := e.durableSession(); d != nil {
+		err := durableDelete(sess, sessionID, d, walOpDeleteEntity, id, sess.ValidateDeleteEntity, sess.DeleteEntityChecked)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return err
+	}
+	return sess.DeleteEntityChecked(id)
 }
 
 // =============================================================================
@@ -478,6 +633,13 @@ func (e *Engine) AddRelationship(sessionID, extID string, sourceID, targetID uin
 	sess, err := e.getOrCreateSession(sessionID)
 	if err != nil {
 		return nil, err
+	}
+	if d := e.durableSession(); d != nil {
+		rel, err := durableAddRelationship(sess, sessionID, d, extID, sourceID, targetID, relType, description, weight)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return rel, err
 	}
 	return sess.AddRelationship(extID, sourceID, targetID, relType, description, weight)
 }
@@ -499,11 +661,22 @@ func (e *Engine) GetRelationshipByEntities(sessionID string, sourceID, targetID 
 }
 
 func (e *Engine) DeleteRelationship(sessionID string, id uint64) bool {
+	return e.DeleteRelationshipChecked(sessionID, id) == nil
+}
+
+func (e *Engine) DeleteRelationshipChecked(sessionID string, id uint64) error {
 	sess, err := e.getSession(sessionID)
 	if err != nil {
-		return false
+		return err
 	}
-	return sess.DeleteRelationship(id)
+	if d := e.durableSession(); d != nil {
+		err := durableDelete(sess, sessionID, d, walOpDeleteRelationship, id, sess.ValidateDeleteRelationship, sess.DeleteRelationshipChecked)
+		if err == nil {
+			e.maybeAutoSnapshot()
+		}
+		return err
+	}
+	return sess.DeleteRelationshipChecked(id)
 }
 
 // =============================================================================
@@ -527,11 +700,15 @@ func (e *Engine) GetCommunity(sessionID string, id uint64) (*types.Community, bo
 }
 
 func (e *Engine) DeleteCommunity(sessionID string, id uint64) bool {
+	return e.DeleteCommunityChecked(sessionID, id) == nil
+}
+
+func (e *Engine) DeleteCommunityChecked(sessionID string, id uint64) error {
 	sess, err := e.getSession(sessionID)
 	if err != nil {
-		return false
+		return err
 	}
-	return sess.DeleteCommunity(id)
+	return sess.DeleteCommunityChecked(id)
 }
 
 // ComputeCommunities runs Leiden clustering and creates communities
@@ -544,7 +721,9 @@ func (e *Engine) ComputeCommunities(sessionID string, config graph.LeidenConfig)
 	// Create adapter for Leiden algorithm
 	entities := sess.GetAllEntities()
 	relationships := sess.GetAllRelationships()
-	idGen := sess.GetIDGenerator()
+	currentDoc, currentTU, currentEnt, currentRel, currentComm, currentQuery := sess.GetIDGenerator().GetCounters()
+	idGen := types.NewIDGenerator()
+	idGen.SetCounters(currentDoc, currentTU, currentEnt, currentRel, currentComm, currentQuery)
 
 	// Build entity and relationship stores for Leiden
 	entStore := &entityStoreAdapter{entities: entities}
@@ -561,16 +740,16 @@ func (e *Engine) ComputeCommunities(sessionID string, config graph.LeidenConfig)
 	leiden := graph.NewLeiden(entStore, relStore, config)
 	clusters := leiden.ComputeCommunities()
 
-	// Clear existing communities
-	sess.ClearCommunities()
-
 	// Build community objects
 	communities := graph.BuildCommunities(clusters, entStore, relStore, idGen, 0)
-
-	for _, comm := range communities {
-		if _, err := sess.AddCommunity(comm.ExternalID, comm.Title, comm.Summary, comm.FullContent, comm.Level, comm.EntityIDs, comm.RelationshipIDs, nil); err != nil {
+	embeddings := make([][]float32, len(communities))
+	if d := e.durableSession(); d != nil {
+		if err := durableReplaceCommunities(sess, sessionID, d, communities, embeddings); err != nil {
 			return nil, err
 		}
+		e.maybeAutoSnapshot()
+	} else if err := sess.ReplaceCommunities(communities, embeddings); err != nil {
+		return nil, err
 	}
 
 	return communities, nil
@@ -599,7 +778,9 @@ func (e *Engine) ComputeHierarchicalCommunities(sessionID string, config graph.L
 
 	entities := sess.GetAllEntities()
 	relationships := sess.GetAllRelationships()
-	idGen := sess.GetIDGenerator()
+	currentDoc, currentTU, currentEnt, currentRel, currentComm, currentQuery := sess.GetIDGenerator().GetCounters()
+	idGen := types.NewIDGenerator()
+	idGen.SetCounters(currentDoc, currentTU, currentEnt, currentRel, currentComm, currentQuery)
 
 	entStore := &entityStoreAdapter{entities: entities}
 	relStore := &relationshipStoreAdapter{
@@ -615,16 +796,16 @@ func (e *Engine) ComputeHierarchicalCommunities(sessionID string, config graph.L
 	leiden := graph.NewLeiden(entStore, relStore, config)
 	hierarchical := leiden.ComputeHierarchicalCommunities()
 
-	// Clear existing communities
-	sess.ClearCommunities()
-
 	// Build community objects from hierarchical results
 	communities := graph.BuildHierarchicalCommunities(hierarchical, entStore, relStore, idGen)
-
-	for _, comm := range communities {
-		if _, err := sess.AddCommunity(comm.ExternalID, comm.Title, comm.Summary, comm.FullContent, comm.Level, comm.EntityIDs, comm.RelationshipIDs, nil); err != nil {
+	embeddings := make([][]float32, len(communities))
+	if d := e.durableSession(); d != nil {
+		if err := durableReplaceCommunities(sess, sessionID, d, communities, embeddings); err != nil {
 			return nil, err
 		}
+		e.maybeAutoSnapshot()
+	} else if err := sess.ReplaceCommunities(communities, embeddings); err != nil {
+		return nil, err
 	}
 
 	return communities, nil
@@ -664,8 +845,38 @@ func (e *Engine) Query(sessionID string, spec types.QuerySpec) (*types.ContextPa
 	entityIndex := sess.GetEntityIndex()
 	communityIndex := sess.GetCommunityIndex()
 
+	readySeedIndexes := make(map[types.SearchType]bool)
+	for _, searchType := range spec.SearchTypes {
+		switch searchType {
+		case types.SearchTypeTextUnit:
+			if textUnitIndex.Count() > 0 {
+				readySeedIndexes[searchType] = true
+			} else {
+				stats.SkippedSeedIndexes = append(stats.SkippedSeedIndexes, string(searchType))
+			}
+		case types.SearchTypeEntity:
+			if entityIndex.Count() > 0 {
+				readySeedIndexes[searchType] = true
+			} else {
+				stats.SkippedSeedIndexes = append(stats.SkippedSeedIndexes, string(searchType))
+			}
+		case types.SearchTypeCommunity:
+			if communityIndex.Count() > 0 {
+				readySeedIndexes[searchType] = true
+			} else {
+				stats.SkippedSeedIndexes = append(stats.SkippedSeedIndexes, string(searchType))
+			}
+		}
+	}
+	if len(readySeedIndexes) == 0 {
+		return nil, fmt.Errorf("%w: no requested seed indexes have embeddings; skipped=%v", ErrRetrievalNotReady, stats.SkippedSeedIndexes)
+	}
+
 	// Phase 1: Vector search on selected indices
 	for _, searchType := range spec.SearchTypes {
+		if !readySeedIndexes[searchType] {
+			continue
+		}
 		switch searchType {
 		case types.SearchTypeTextUnit:
 			if textUnitIndex != nil {
@@ -930,14 +1141,18 @@ func (e *Engine) Info() types.ServerInfo {
 	}
 
 	return types.ServerInfo{
-		Version:           version.Version,
-		DocumentCount:     docCount,
-		TextUnitCount:     tuCount,
-		EntityCount:       entCount,
-		RelationshipCount: relCount,
-		CommunityCount:    commCount,
-		VectorDim:         e.vectorDim,
-		SessionCount:      len(e.sessions),
+		Version:             version.Version,
+		DocumentCount:       docCount,
+		TextUnitCount:       tuCount,
+		EntityCount:         entCount,
+		RelationshipCount:   relCount,
+		CommunityCount:      commCount,
+		VectorDim:           e.vectorDim,
+		SessionCount:        len(e.sessions),
+		SessionStoreMode:    e.storeMode,
+		WALSyncPolicy:       e.walPolicy,
+		WALSyncIntervalMS:   e.walInterval.Milliseconds(),
+		SessionStoreHealthy: e.healthy.Load(),
 	}
 }
 
@@ -949,14 +1164,18 @@ func (e *Engine) InfoForSession(sessionID string) (types.ServerInfo, error) {
 	}
 
 	return types.ServerInfo{
-		Version:           version.Version,
-		DocumentCount:     sess.DocumentCount(),
-		TextUnitCount:     sess.TextUnitCount(),
-		EntityCount:       sess.EntityCount(),
-		RelationshipCount: sess.RelationshipCount(),
-		CommunityCount:    sess.CommunityCount(),
-		VectorDim:         e.vectorDim,
-		SessionCount:      1,
+		Version:             version.Version,
+		DocumentCount:       sess.DocumentCount(),
+		TextUnitCount:       sess.TextUnitCount(),
+		EntityCount:         sess.EntityCount(),
+		RelationshipCount:   sess.RelationshipCount(),
+		CommunityCount:      sess.CommunityCount(),
+		VectorDim:           e.vectorDim,
+		SessionCount:        1,
+		SessionStoreMode:    e.storeMode,
+		WALSyncPolicy:       e.walPolicy,
+		WALSyncIntervalMS:   e.walInterval.Milliseconds(),
+		SessionStoreHealthy: e.healthy.Load(),
 	}, nil
 }
 
@@ -971,40 +1190,7 @@ func (e *Engine) RebuildVectorIndices(sessionID string) error {
 		return err
 	}
 
-	// Get vectors from current indices before recreating
-	tuIdx := sess.GetTextUnitIndex()
-	entIdx := sess.GetEntityIndex()
-	commIdx := sess.GetCommunityIndex()
-
-	textUnitVectors := tuIdx.GetAllVectors()
-	entityVectors := entIdx.GetAllVectors()
-	communityVectors := commIdx.GetAllVectors()
-
-	// Clear and rebuild
-	sess.Clear()
-
-	// Re-add vectors
-	newTuIdx := sess.GetTextUnitIndex()
-	newEntIdx := sess.GetEntityIndex()
-	newCommIdx := sess.GetCommunityIndex()
-
-	for id, vec := range textUnitVectors {
-		if err := newTuIdx.Add(id, vec); err != nil {
-			return err
-		}
-	}
-	for id, vec := range entityVectors {
-		if err := newEntIdx.Add(id, vec); err != nil {
-			return err
-		}
-	}
-	for id, vec := range communityVectors {
-		if err := newCommIdx.Add(id, vec); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return sess.RebuildVectorIndices()
 }
 
 // =============================================================================
@@ -1018,15 +1204,14 @@ func (e *Engine) MSetDocuments(sessionID string, inputs []types.BulkDocumentInpu
 		return nil, err
 	}
 
-	ids := make([]uint64, 0, len(inputs))
-	for _, input := range inputs {
-		doc, err := sess.AddDocument(input.ExternalID, input.Filename)
-		if err != nil {
-			continue
+	if d := e.durableSession(); d != nil {
+		ids, err := durableMSetDocuments(sess, sessionID, d, inputs)
+		if err == nil {
+			e.maybeAutoSnapshot()
 		}
-		ids = append(ids, doc.ID)
+		return ids, err
 	}
-	return ids, nil
+	return sess.MSetDocumentsAtomic(inputs)
 }
 
 // MGetDocuments gets multiple documents
@@ -1052,15 +1237,14 @@ func (e *Engine) MSetTextUnits(sessionID string, inputs []types.BulkTextUnitInpu
 		return nil, err
 	}
 
-	ids := make([]uint64, 0, len(inputs))
-	for _, input := range inputs {
-		tu, err := sess.AddTextUnit(input.ExternalID, input.DocumentID, input.Content, input.Embedding, input.TokenCount)
-		if err != nil {
-			continue
+	if d := e.durableSession(); d != nil {
+		ids, err := durableMSetTextUnits(sess, sessionID, d, inputs)
+		if err == nil {
+			e.maybeAutoSnapshot()
 		}
-		ids = append(ids, tu.ID)
+		return ids, err
 	}
-	return ids, nil
+	return sess.MSetTextUnitsAtomic(inputs)
 }
 
 // MGetTextUnits gets multiple text units
@@ -1086,15 +1270,14 @@ func (e *Engine) MSetEntities(sessionID string, inputs []types.BulkEntityInput) 
 		return nil, err
 	}
 
-	ids := make([]uint64, 0, len(inputs))
-	for _, input := range inputs {
-		ent, err := sess.AddEntity(input.ExternalID, input.Title, input.Type, input.Description, input.Embedding)
-		if err != nil {
-			continue
+	if d := e.durableSession(); d != nil {
+		ids, err := durableMSetEntities(sess, sessionID, d, inputs)
+		if err == nil {
+			e.maybeAutoSnapshot()
 		}
-		ids = append(ids, ent.ID)
+		return ids, err
 	}
-	return ids, nil
+	return sess.MSetEntitiesAtomic(inputs)
 }
 
 // MGetEntities gets multiple entities
@@ -1129,15 +1312,14 @@ func (e *Engine) MSetRelationships(sessionID string, inputs []types.BulkRelation
 		return nil, err
 	}
 
-	ids := make([]uint64, 0, len(inputs))
-	for _, input := range inputs {
-		rel, err := sess.AddRelationship(input.ExternalID, input.SourceID, input.TargetID, input.Type, input.Description, input.Weight)
-		if err != nil {
-			continue
+	if d := e.durableSession(); d != nil {
+		ids, err := durableMSetRelationships(sess, sessionID, d, inputs)
+		if err == nil {
+			e.maybeAutoSnapshot()
 		}
-		ids = append(ids, rel.ID)
+		return ids, err
 	}
-	return ids, nil
+	return sess.MSetRelationshipsAtomic(inputs)
 }
 
 // MGetRelationships gets multiple relationships
@@ -1222,6 +1404,7 @@ func (e *Engine) Restore(r io.Reader) error {
 		if err := sess.RestoreFromSnapshot(sessSnapshot); err != nil {
 			return fmt.Errorf("restore session %s: %w", id, err)
 		}
+		e.applyResourceLimits(sess)
 		e.sessions[id] = sess
 	}
 

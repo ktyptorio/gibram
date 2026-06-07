@@ -193,10 +193,10 @@ func (t *TextUnit) RemoveEntityID(entityID uint64) {
 
 type Entity struct {
 	ID          uint64            `json:"id"`
-	ExternalID  string            `json:"external_id"`   // "ent-001"
-	Title       string            `json:"title"`         // "BANK INDONESIA" (uppercase for dedup)
-	Type        string            `json:"type"`          // "organization", "person", "location", "concept"
-	Description string            `json:"description"`   // semantic content for embedding
+	ExternalID  string            `json:"external_id"` // "ent-001"
+	Title       string            `json:"title"`       // "BANK INDONESIA" (uppercase for dedup)
+	Type        string            `json:"type"`        // "organization", "person", "location", "concept"
+	Description string            `json:"description"` // semantic content for embedding
 	Attrs       map[string]string `json:"attrs,omitempty"`
 	TextUnitIDs []uint64          `json:"text_unit_ids"` // linked chunks
 	CreatedAt   int64             `json:"created_at"`
@@ -368,11 +368,12 @@ type RelationshipResult struct {
 }
 
 type QueryStats struct {
-	TextUnitsSearched   int   `json:"text_units_searched"`
-	EntitiesSearched    int   `json:"entities_searched"`
-	CommunitiesSearched int   `json:"communities_searched"`
-	EdgesScanned        int   `json:"edges_scanned"`
-	DurationMicros      int64 `json:"duration_micros"`
+	TextUnitsSearched   int      `json:"text_units_searched"`
+	EntitiesSearched    int      `json:"entities_searched"`
+	CommunitiesSearched int      `json:"communities_searched"`
+	EdgesScanned        int      `json:"edges_scanned"`
+	DurationMicros      int64    `json:"duration_micros"`
+	SkippedSeedIndexes  []string `json:"skipped_seed_indexes"`
 }
 
 type ContextPack struct {
@@ -417,14 +418,18 @@ type ExplainPack struct {
 // =============================================================================
 
 type ServerInfo struct {
-	Version           string `json:"version"`
-	DocumentCount     int    `json:"document_count"`
-	TextUnitCount     int    `json:"text_unit_count"`
-	EntityCount       int    `json:"entity_count"`
-	RelationshipCount int    `json:"relationship_count"`
-	CommunityCount    int    `json:"community_count"`
-	VectorDim         int    `json:"vector_dim"`
-	SessionCount      int    `json:"session_count"`
+	Version             string `json:"version"`
+	DocumentCount       int    `json:"document_count"`
+	TextUnitCount       int    `json:"text_unit_count"`
+	EntityCount         int    `json:"entity_count"`
+	RelationshipCount   int    `json:"relationship_count"`
+	CommunityCount      int    `json:"community_count"`
+	VectorDim           int    `json:"vector_dim"`
+	SessionCount        int    `json:"session_count"`
+	SessionStoreMode    string `json:"session_store_mode"`
+	WALSyncPolicy       string `json:"wal_sync_policy,omitempty"`
+	WALSyncIntervalMS   int64  `json:"wal_sync_interval_ms,omitempty"`
+	SessionStoreHealthy bool   `json:"session_store_healthy"`
 }
 
 // =============================================================================

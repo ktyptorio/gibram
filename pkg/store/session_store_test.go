@@ -3,8 +3,12 @@ package store
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gibram-io/gibram/pkg/types"
 )
 
 const testVectorDim = 64
@@ -104,6 +108,105 @@ func TestAddDocument(t *testing.T) {
 	}
 }
 
+func TestAddDocumentRequiresExternalID(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	_, err := store.AddDocument("", "test.pdf")
+	if err == nil {
+		t.Fatal("Expected AddDocument to reject missing external_id")
+	}
+	if !strings.Contains(err.Error(), "document external_id is required") {
+		t.Fatalf("Expected external_id error, got %v", err)
+	}
+	if store.DocumentCount() != 0 {
+		t.Fatalf("Expected no document to be created, got %d", store.DocumentCount())
+	}
+}
+
+func TestSessionStoreQuotasRejectBeforeMutation(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+	store.SetQuotas(0, 0, 1, 0)
+
+	if _, err := store.AddDocument("doc-1", "one.txt"); err != nil {
+		t.Fatalf("first AddDocument failed: %v", err)
+	}
+	if _, err := store.AddDocument("doc-2", "two.txt"); err == nil {
+		t.Fatal("expected document quota error")
+	} else if err != types.ErrDocumentQuotaExceeded {
+		t.Fatalf("expected document quota error, got %v", err)
+	}
+	if got := store.DocumentCount(); got != 1 {
+		t.Fatalf("quota rejection mutated document count: got %d", got)
+	}
+	info := store.GetInfo()
+	if info.DocumentCount != 1 || info.MemoryBytes == 0 {
+		t.Fatalf("unexpected session info after quota rejection: %+v", info)
+	}
+}
+
+func TestSessionStoreBulkQuotaIsAtomic(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+	store.SetQuotas(0, 0, 1, 0)
+
+	_, err := store.MSetDocumentsAtomic([]types.BulkDocumentInput{
+		{ExternalID: "doc-1", Filename: "one.txt"},
+		{ExternalID: "doc-2", Filename: "two.txt"},
+	})
+	if err == nil {
+		t.Fatal("expected bulk document quota error")
+	}
+	if got := store.DocumentCount(); got != 0 {
+		t.Fatalf("bulk quota rejection should commit no documents, got %d", got)
+	}
+}
+
+func TestSessionStoreMemoryAdmissionRejectsUnboundedWrites(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+	store.SetQuotas(0, 0, 0, 200)
+
+	if _, err := store.AddDocument("doc-1", "one.txt"); err != nil {
+		t.Fatalf("AddDocument failed: %v", err)
+	}
+	_, err := store.AddTextUnit("tu-1", 1, strings.Repeat("x", 256), nil, 1)
+	if err == nil {
+		t.Fatal("expected memory quota error")
+	}
+	if err != types.ErrMemoryQuotaExceeded {
+		t.Fatalf("expected memory quota error, got %v", err)
+	}
+	if got := store.TextUnitCount(); got != 0 {
+		t.Fatalf("memory quota rejection mutated textunit count: got %d", got)
+	}
+}
+
+func TestAddDocumentAllowsDuplicateFilename(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	doc1 := mustAddDocument(t, store, "doc-001", "shared.pdf")
+	doc2 := mustAddDocument(t, store, "doc-002", "shared.pdf")
+
+	if doc1.ID == doc2.ID {
+		t.Fatal("Expected duplicate filename documents to have distinct IDs")
+	}
+	if store.DocumentCount() != 2 {
+		t.Fatalf("Expected 2 documents, got %d", store.DocumentCount())
+	}
+	if _, ok := store.GetDocumentByExternalID("doc-001"); !ok {
+		t.Fatal("Expected first document to remain addressable by external_id")
+	}
+	if _, ok := store.GetDocumentByExternalID("doc-002"); !ok {
+		t.Fatal("Expected second document to remain addressable by external_id")
+	}
+
+	ids := store.docByFilename["shared.pdf"]
+	if len(ids) != 2 {
+		t.Fatalf("Expected filename index to keep both document IDs, got %v", ids)
+	}
+	if ids[0] != doc1.ID || ids[1] != doc2.ID {
+		t.Fatalf("Expected filename index [%d %d], got %v", doc1.ID, doc2.ID, ids)
+	}
+}
+
 func TestAddDocumentDuplicate(t *testing.T) {
 	store := NewSessionStore("test-session", testVectorDim)
 
@@ -116,6 +219,11 @@ func TestAddDocumentDuplicate(t *testing.T) {
 	_, err = store.AddDocument("doc-001", "another.pdf")
 	if err == nil {
 		t.Error("Expected error when adding duplicate document")
+	}
+
+	_, err = store.AddDocument("doc-001", "test.pdf")
+	if err == nil {
+		t.Error("Expected duplicate external_id to fail even when filename matches")
 	}
 }
 
@@ -190,6 +298,24 @@ func TestDeleteDocument(t *testing.T) {
 	}
 }
 
+func TestDeleteDocumentRestrictedWithTextUnits(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+	mustAddTextUnit(t, store, "tu-001", doc.ID, "Content", make([]float32, testVectorDim), 5)
+
+	err := store.DeleteDocumentChecked(doc.ID)
+	if err == nil {
+		t.Fatal("Expected document delete with dependent text units to fail")
+	}
+	if !strings.Contains(err.Error(), "document 1 has dependent text units") {
+		t.Fatalf("Expected dependent text units error, got %v", err)
+	}
+	if store.DocumentCount() != 1 {
+		t.Fatalf("Expected document to remain, got %d documents", store.DocumentCount())
+	}
+}
+
 func TestGetAllDocuments(t *testing.T) {
 	store := NewSessionStore("test-session", testVectorDim)
 
@@ -236,6 +362,101 @@ func TestAddTextUnit(t *testing.T) {
 
 	if store.TextUnitCount() != 1 {
 		t.Errorf("Expected 1 text unit, got %d", store.TextUnitCount())
+	}
+}
+
+func TestAddTextUnitRequiresExternalID(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+	doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+
+	_, err := store.AddTextUnit(" ", doc.ID, "Test content", make([]float32, testVectorDim), 5)
+	if err == nil {
+		t.Fatal("Expected AddTextUnit to reject missing external_id")
+	}
+	if !strings.Contains(err.Error(), "textunit external_id is required") {
+		t.Fatalf("Expected external_id error, got %v", err)
+	}
+	if store.TextUnitCount() != 0 {
+		t.Fatalf("Expected no text unit to be created, got %d", store.TextUnitCount())
+	}
+}
+
+func TestAddTextUnitRequiresExistingDocument(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	_, err := store.AddTextUnit("tu-001", 999, "Test content", make([]float32, testVectorDim), 5)
+	if err == nil {
+		t.Fatal("Expected AddTextUnit to reject missing document_id")
+	}
+	if !strings.Contains(err.Error(), "textunit document_id 999 does not exist") {
+		t.Fatalf("Expected document_id error, got %v", err)
+	}
+	if store.TextUnitCount() != 0 {
+		t.Fatalf("Expected no text unit to be created, got %d", store.TextUnitCount())
+	}
+}
+
+func TestAddTextUnitAllowsEmptyEmbedding(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+	doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+
+	tu, err := store.AddTextUnit("tu-001", doc.ID, "Test content", nil, 5)
+	if err != nil {
+		t.Fatalf("AddTextUnit should allow empty embedding: %v", err)
+	}
+	if tu.ID == 0 {
+		t.Fatal("Expected text unit ID")
+	}
+	if store.TextUnitCount() != 1 {
+		t.Fatalf("Expected 1 text unit, got %d", store.TextUnitCount())
+	}
+	if store.GetTextUnitIndex().Count() != 0 {
+		t.Fatal("Expected empty embedding text unit to remain non-indexed")
+	}
+}
+
+func TestAddTextUnitRejectsInvalidEmbedding(t *testing.T) {
+	tests := []struct {
+		name      string
+		embedding []float32
+		want      string
+	}{
+		{
+			name:      "wrong dimension",
+			embedding: make([]float32, testVectorDim-1),
+			want:      "textunit embedding dimension mismatch",
+		},
+		{
+			name:      "NaN",
+			embedding: append([]float32{float32(math.NaN())}, make([]float32, testVectorDim-1)...),
+			want:      "textunit embedding contains non-finite value at index 0",
+		},
+		{
+			name:      "Inf",
+			embedding: append([]float32{float32(math.Inf(1))}, make([]float32, testVectorDim-1)...),
+			want:      "textunit embedding contains non-finite value at index 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewSessionStore("test-session", testVectorDim)
+			doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+
+			_, err := store.AddTextUnit("tu-001", doc.ID, "Test content", tt.embedding, 5)
+			if err == nil {
+				t.Fatal("Expected AddTextUnit to reject invalid embedding")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %v", tt.want, err)
+			}
+			if store.TextUnitCount() != 0 {
+				t.Fatalf("Expected no text unit to be created, got %d", store.TextUnitCount())
+			}
+			if got := store.GetTextUnitsByDocumentID(doc.ID); len(got) != 0 {
+				t.Fatalf("Expected no text unit document index entries, got %d", len(got))
+			}
+		})
 	}
 }
 
@@ -305,6 +526,29 @@ func TestDeleteTextUnit(t *testing.T) {
 	}
 }
 
+func TestDeleteTextUnitRestrictedWhenLinkedToEntity(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+	tu := mustAddTextUnit(t, store, "tu-001", doc.ID, "Content", embedding, 5)
+	ent := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	if !store.LinkTextUnitToEntity(tu.ID, ent.ID) {
+		t.Fatal("Expected link to succeed")
+	}
+
+	err := store.DeleteTextUnitChecked(tu.ID)
+	if err == nil {
+		t.Fatal("Expected linked text unit delete to fail")
+	}
+	if !strings.Contains(err.Error(), "textunit 1 is linked to entities") {
+		t.Fatalf("Expected linked entities error, got %v", err)
+	}
+	if store.TextUnitCount() != 1 {
+		t.Fatalf("Expected text unit to remain, got %d text units", store.TextUnitCount())
+	}
+}
+
 // =============================================================================
 // Entity Operations Tests
 // =============================================================================
@@ -340,6 +584,21 @@ func TestAddEntity(t *testing.T) {
 	}
 }
 
+func TestAddEntityRequiresExternalID(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	_, err := store.AddEntity("", "Test Entity", "person", "A test entity", make([]float32, testVectorDim))
+	if err == nil {
+		t.Fatal("Expected AddEntity to reject missing external_id")
+	}
+	if !strings.Contains(err.Error(), "entity external_id is required") {
+		t.Fatalf("Expected external_id error, got %v", err)
+	}
+	if store.EntityCount() != 0 {
+		t.Fatalf("Expected no entity to be created, got %d", store.EntityCount())
+	}
+}
+
 func TestAddEntityDuplicate(t *testing.T) {
 	store := NewSessionStore("test-session", testVectorDim)
 
@@ -354,6 +613,85 @@ func TestAddEntityDuplicate(t *testing.T) {
 	_, err = store.AddEntity("ent-001", "Entity 2", "person", "Desc 2", embedding)
 	if err == nil {
 		t.Error("Expected error when adding duplicate entity")
+	}
+}
+
+func TestAddEntityDuplicateNormalizedTitle(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	_, err := store.AddEntity("ent-001", "Bank Indonesia", "organization", "Desc 1", nil)
+	if err != nil {
+		t.Fatalf("First AddEntity failed: %v", err)
+	}
+
+	_, err = store.AddEntity("ent-002", " bank indonesia ", "organization", "Desc 2", nil)
+	if err == nil {
+		t.Fatal("Expected duplicate normalized title to fail")
+	}
+	if !strings.Contains(err.Error(), "entity with title  bank indonesia  already exists") {
+		t.Fatalf("Expected duplicate title error, got %v", err)
+	}
+	if store.EntityCount() != 1 {
+		t.Fatalf("Expected only first entity to be created, got %d", store.EntityCount())
+	}
+}
+
+func TestAddEntityAllowsEmptyEmbedding(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	ent, err := store.AddEntity("ent-001", "Test Entity", "person", "A test entity", nil)
+	if err != nil {
+		t.Fatalf("AddEntity should allow empty embedding: %v", err)
+	}
+	if ent.ID == 0 {
+		t.Fatal("Expected entity ID")
+	}
+	if store.EntityCount() != 1 {
+		t.Fatalf("Expected 1 entity, got %d", store.EntityCount())
+	}
+	if store.GetEntityIndex().Count() != 0 {
+		t.Fatal("Expected empty embedding entity to remain non-indexed")
+	}
+}
+
+func TestAddEntityRejectsInvalidEmbedding(t *testing.T) {
+	tests := []struct {
+		name      string
+		embedding []float32
+		want      string
+	}{
+		{
+			name:      "wrong dimension",
+			embedding: make([]float32, testVectorDim-1),
+			want:      "entity embedding dimension mismatch",
+		},
+		{
+			name:      "NaN",
+			embedding: append([]float32{float32(math.NaN())}, make([]float32, testVectorDim-1)...),
+			want:      "entity embedding contains non-finite value at index 0",
+		},
+		{
+			name:      "Inf",
+			embedding: append([]float32{float32(math.Inf(1))}, make([]float32, testVectorDim-1)...),
+			want:      "entity embedding contains non-finite value at index 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewSessionStore("test-session", testVectorDim)
+
+			_, err := store.AddEntity("ent-001", "Test Entity", "person", "A test entity", tt.embedding)
+			if err == nil {
+				t.Fatal("Expected AddEntity to reject invalid embedding")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %v", tt.want, err)
+			}
+			if store.EntityCount() != 0 {
+				t.Fatalf("Expected no entity to be created, got %d", store.EntityCount())
+			}
+		})
 	}
 }
 
@@ -451,6 +789,68 @@ func TestDeleteEntity(t *testing.T) {
 	}
 }
 
+func TestDeleteEntityRestrictedWhenLinkedToTextUnits(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	doc := mustAddDocument(t, store, "doc-001", "test.pdf")
+	tu := mustAddTextUnit(t, store, "tu-001", doc.ID, "Content", embedding, 5)
+	ent := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	if !store.LinkTextUnitToEntity(tu.ID, ent.ID) {
+		t.Fatal("Expected link to succeed")
+	}
+
+	err := store.DeleteEntityChecked(ent.ID)
+	if err == nil {
+		t.Fatal("Expected linked entity delete to fail")
+	}
+	if !strings.Contains(err.Error(), "entity 1 is linked to text units") {
+		t.Fatalf("Expected linked text units error, got %v", err)
+	}
+	if store.EntityCount() != 1 {
+		t.Fatalf("Expected entity to remain, got %d entities", store.EntityCount())
+	}
+}
+
+func TestDeleteEntityRestrictedWhenLinkedToRelationships(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+	mustAddRelationship(t, store, "rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
+
+	err := store.DeleteEntityChecked(e1.ID)
+	if err == nil {
+		t.Fatal("Expected relationship-linked entity delete to fail")
+	}
+	if !strings.Contains(err.Error(), "entity 1 is linked to relationships") {
+		t.Fatalf("Expected linked relationships error, got %v", err)
+	}
+	if store.EntityCount() != 2 {
+		t.Fatalf("Expected entities to remain, got %d entities", store.EntityCount())
+	}
+}
+
+func TestDeleteEntityRestrictedWhenReferencedByCommunity(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	ent := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	mustAddCommunity(t, store, "comm-001", "Community", "Summary", "Full", 0, []uint64{ent.ID}, nil, embedding)
+
+	err := store.DeleteEntityChecked(ent.ID)
+	if err == nil {
+		t.Fatal("Expected entity referenced by community to fail")
+	}
+	if !strings.Contains(err.Error(), "entity 1 is referenced by communities") {
+		t.Fatalf("Expected community dependency error, got %v", err)
+	}
+	if store.EntityCount() != 1 {
+		t.Fatalf("Expected entity to remain, got %d entities", store.EntityCount())
+	}
+}
+
 func TestListEntitiesPagination(t *testing.T) {
 	store := NewSessionStore("test-session", testVectorDim)
 
@@ -526,6 +926,22 @@ func TestAddRelationship(t *testing.T) {
 	}
 }
 
+func TestAddRelationshipAllowsMissingExternalID(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+
+	rel, err := store.AddRelationship("", e1.ID, e2.ID, "KNOWS", "They know each other", 1.0)
+	if err != nil {
+		t.Fatalf("AddRelationship should allow missing external_id: %v", err)
+	}
+	if rel.ExternalID != "" {
+		t.Fatalf("Expected empty relationship external_id, got %q", rel.ExternalID)
+	}
+}
+
 func TestAddRelationshipDuplicate(t *testing.T) {
 	store := NewSessionStore("test-session", testVectorDim)
 
@@ -542,6 +958,66 @@ func TestAddRelationshipDuplicate(t *testing.T) {
 	_, err = store.AddRelationship("rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
 	if err == nil {
 		t.Error("Expected error when adding duplicate relationship")
+	}
+}
+
+func TestAddRelationshipAllowsSameSourceTargetWithDifferentType(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+
+	rel1 := mustAddRelationship(t, store, "rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
+	rel2, err := store.AddRelationship("rel-002", e1.ID, e2.ID, "WORKS_WITH", "Desc", 1.0)
+	if err != nil {
+		t.Fatalf("Expected same source/target with different type to succeed: %v", err)
+	}
+	if rel1.ID == rel2.ID {
+		t.Fatal("Expected relationships to have distinct IDs")
+	}
+	if store.RelationshipCount() != 2 {
+		t.Fatalf("Expected 2 relationships, got %d", store.RelationshipCount())
+	}
+}
+
+func TestAddRelationshipRejectsDuplicateSourceTargetType(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+
+	mustAddRelationship(t, store, "rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
+	_, err := store.AddRelationship("rel-002", e1.ID, e2.ID, "KNOWS", "Another desc", 1.0)
+	if err == nil {
+		t.Fatal("Expected duplicate relationship identity to fail")
+	}
+	if !strings.Contains(err.Error(), "relationship from 1 to 2 with type KNOWS already exists") {
+		t.Fatalf("Expected duplicate relationship identity error, got %v", err)
+	}
+}
+
+func TestAddRelationshipRequiresExistingEntities(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+
+	_, err := store.AddRelationship("rel-001", e1.ID, 999, "KNOWS", "Desc", 1.0)
+	if err == nil {
+		t.Fatal("Expected missing target entity to fail")
+	}
+	if !strings.Contains(err.Error(), "relationship target_id 999 does not exist") {
+		t.Fatalf("Expected missing target error, got %v", err)
+	}
+
+	_, err = store.AddRelationship("rel-002", 999, e1.ID, "KNOWS", "Desc", 1.0)
+	if err == nil {
+		t.Fatal("Expected missing source entity to fail")
+	}
+	if !strings.Contains(err.Error(), "relationship source_id 999 does not exist") {
+		t.Fatalf("Expected missing source error, got %v", err)
 	}
 }
 
@@ -592,6 +1068,27 @@ func TestDeleteRelationship(t *testing.T) {
 	ok = store.DeleteRelationship(99999)
 	if ok {
 		t.Error("DeleteRelationship should return false for non-existent ID")
+	}
+}
+
+func TestDeleteRelationshipRestrictedWhenReferencedByCommunity(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+	rel := mustAddRelationship(t, store, "rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
+	mustAddCommunity(t, store, "comm-001", "Community", "Summary", "Full", 0, []uint64{e1.ID, e2.ID}, []uint64{rel.ID}, embedding)
+
+	err := store.DeleteRelationshipChecked(rel.ID)
+	if err == nil {
+		t.Fatal("Expected relationship referenced by community to fail")
+	}
+	if !strings.Contains(err.Error(), "relationship 1 is referenced by communities") {
+		t.Fatalf("Expected community dependency error, got %v", err)
+	}
+	if store.RelationshipCount() != 1 {
+		t.Fatalf("Expected relationship to remain, got %d relationships", store.RelationshipCount())
 	}
 }
 
@@ -700,6 +1197,129 @@ func TestAddCommunity(t *testing.T) {
 
 	if store.CommunityCount() != 1 {
 		t.Errorf("Expected 1 community, got %d", store.CommunityCount())
+	}
+}
+
+func TestAddCommunityAllowsMissingExternalID(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+
+	comm, err := store.AddCommunity("", "Test Community", "Summary", "Full content", 0, []uint64{e1.ID, e2.ID}, nil, embedding)
+	if err != nil {
+		t.Fatalf("AddCommunity should allow missing external_id: %v", err)
+	}
+	if comm.ExternalID != "" {
+		t.Fatalf("Expected empty community external_id, got %q", comm.ExternalID)
+	}
+}
+
+func TestAddCommunityRequiresExistingReferences(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+
+	_, err := store.AddCommunity("comm-001", "Test Community", "Summary", "Full content", 0, []uint64{e1.ID, 999}, nil, embedding)
+	if err == nil {
+		t.Fatal("Expected missing community entity reference to fail")
+	}
+	if !strings.Contains(err.Error(), "community entity_id 999 does not exist") {
+		t.Fatalf("Expected missing entity reference error, got %v", err)
+	}
+
+	_, err = store.AddCommunity("comm-002", "Test Community", "Summary", "Full content", 0, []uint64{e1.ID}, []uint64{999}, embedding)
+	if err == nil {
+		t.Fatal("Expected missing community relationship reference to fail")
+	}
+	if !strings.Contains(err.Error(), "community relationship_id 999 does not exist") {
+		t.Fatalf("Expected missing relationship reference error, got %v", err)
+	}
+	if store.CommunityCount() != 0 {
+		t.Fatalf("Expected no community to be created, got %d", store.CommunityCount())
+	}
+}
+
+func TestAddCommunityAllowsEmptyEmbedding(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+
+	comm, err := store.AddCommunity("comm-001", "Test Community", "Summary", "Full content", 0, []uint64{e1.ID}, nil, nil)
+	if err != nil {
+		t.Fatalf("AddCommunity should allow empty embedding: %v", err)
+	}
+	if comm.ID == 0 {
+		t.Fatal("Expected community ID")
+	}
+	if store.GetCommunityIndex().Count() != 0 {
+		t.Fatal("Expected empty embedding community to remain non-indexed")
+	}
+}
+
+func TestAddCommunityRejectsInvalidEmbedding(t *testing.T) {
+	tests := []struct {
+		name      string
+		embedding []float32
+		want      string
+	}{
+		{
+			name:      "wrong dimension",
+			embedding: make([]float32, testVectorDim-1),
+			want:      "community embedding dimension mismatch",
+		},
+		{
+			name:      "NaN",
+			embedding: append([]float32{float32(math.NaN())}, make([]float32, testVectorDim-1)...),
+			want:      "community embedding contains non-finite value at index 0",
+		},
+		{
+			name:      "Inf",
+			embedding: append([]float32{float32(math.Inf(1))}, make([]float32, testVectorDim-1)...),
+			want:      "community embedding contains non-finite value at index 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewSessionStore("test-session", testVectorDim)
+			entity := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", make([]float32, testVectorDim))
+
+			_, err := store.AddCommunity("comm-001", "Test Community", "Summary", "Full content", 0, []uint64{entity.ID}, nil, tt.embedding)
+			if err == nil {
+				t.Fatal("Expected AddCommunity to reject invalid embedding")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %v", tt.want, err)
+			}
+			if store.CommunityCount() != 0 {
+				t.Fatalf("Expected no community to be created, got %d", store.CommunityCount())
+			}
+		})
+	}
+}
+
+func TestGetCommunityAfterValidatedReferences(t *testing.T) {
+	store := NewSessionStore("test-session", testVectorDim)
+
+	embedding := make([]float32, testVectorDim)
+	e1 := mustAddEntity(t, store, "ent-001", "Entity 1", "person", "Desc", embedding)
+	e2 := mustAddEntity(t, store, "ent-002", "Entity 2", "person", "Desc", embedding)
+	rel := mustAddRelationship(t, store, "rel-001", e1.ID, e2.ID, "KNOWS", "Desc", 1.0)
+
+	comm := mustAddCommunity(t, store, "comm-001", "Test Community", "Summary", "Full content", 0, []uint64{e1.ID, e2.ID}, []uint64{rel.ID}, embedding)
+	retrieved, ok := store.GetCommunity(comm.ID)
+	if !ok {
+		t.Fatal("Expected community to be retrievable after validation")
+	}
+	if len(retrieved.EntityIDs) != 2 {
+		t.Fatalf("Expected 2 community entity references, got %d", len(retrieved.EntityIDs))
+	}
+	if len(retrieved.RelationshipIDs) != 1 || retrieved.RelationshipIDs[0] != rel.ID {
+		t.Fatalf("Expected relationship reference %d, got %v", rel.ID, retrieved.RelationshipIDs)
 	}
 }
 
@@ -932,15 +1552,16 @@ func TestCompleteWorkflow(t *testing.T) {
 		t.Errorf("Expected 1 community, got %d", info.CommunityCount)
 	}
 
-	// Clean up
-	store.DeleteCommunity(comm.ID)
-	store.DeleteRelationship(rel.ID)
-	store.DeleteEntity(e1.ID)
-	store.DeleteEntity(e2.ID)
-	store.DeleteTextUnit(tu1.ID)
-	store.DeleteTextUnit(tu2.ID)
-	store.DeleteDocument(doc1.ID)
-	store.DeleteDocument(doc2.ID)
+	// Clean up complete workflow state without testing delete ordering here.
+	_ = comm
+	_ = rel
+	_ = e1
+	_ = e2
+	_ = tu1
+	_ = tu2
+	_ = doc1
+	_ = doc2
+	store.Clear()
 
 	// Verify empty
 	info = store.GetInfo()

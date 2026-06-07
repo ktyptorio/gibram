@@ -127,7 +127,7 @@ flowchart TB
 - **Hierarchical Leiden Clustering**: Automatic community detection at multiple levels
 - **Protobuf Protocol**: Efficient binary wire format for production use
 - **Custom Components**: Swap chunkers, extractors, or embedders in Python SDK
-- **Optional Persistence**: WAL + Snapshot for durability (disabled by default)
+- **Optional Durable Mode**: WAL + Snapshot for explicit production restart recovery (disabled by default)
 
 ## System Requirements
 
@@ -140,6 +140,7 @@ flowchart TB
 1. **[Start the server](getting-started/server.md)** - Get GibRAM running locally
 2. **[Index your first documents](getting-started/python-sdk.md)** - Try the Python SDK
 3. **[Configure for production](server/configuration-basics.md)** - Security, TLS, auth
+4. **[Operate Durable Session Store](server/durable-session-store.md)** - WAL, snapshots, recovery, RPO/RTO
 
 ## Support
 

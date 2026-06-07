@@ -24,9 +24,9 @@ type Session struct {
 	mu sync.RWMutex
 
 	// Identity
-	ID        string `json:"id"`         // session identifier (external, application-provided)
-	CreatedAt int64  `json:"created_at"` // unix timestamp in nanoseconds
-	LastAccess int64 `json:"last_access"` // unix timestamp in nanoseconds
+	ID         string `json:"id"`          // session identifier (external, application-provided)
+	CreatedAt  int64  `json:"created_at"`  // unix timestamp in nanoseconds
+	LastAccess int64  `json:"last_access"` // unix timestamp in nanoseconds
 
 	// TTL (session-level only, values in nanoseconds)
 	TTL     int64 `json:"ttl,omitempty"`      // absolute TTL in nanoseconds (0 = no expiry)
@@ -204,23 +204,47 @@ func (s *Session) SubMemory(bytes int64) {
 	}
 }
 
+// SetUsage replaces tracked usage counters after restore or rebuild.
+func (s *Session) SetUsage(entityCount, relationshipCount, documentCount int, memoryBytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.EntityCount = entityCount
+	s.RelationshipCount = relationshipCount
+	s.DocumentCount = documentCount
+	s.MemoryBytes = memoryBytes
+}
+
+// MemoryUsage returns the current approximate memory usage.
+func (s *Session) MemoryUsage() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.MemoryBytes
+}
+
+// QuotaSnapshot returns the configured session quotas.
+func (s *Session) QuotaSnapshot() (maxEntities, maxRelationships, maxDocuments int, maxMemoryBytes int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.MaxEntities, s.MaxRelationships, s.MaxDocuments, s.MaxMemoryBytes
+}
+
 // IsExpired checks if the session has expired
 func (s *Session) IsExpired() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	now := time.Now().UnixNano()
-	
+
 	// Check absolute TTL
 	if s.TTL > 0 && s.CreatedAt+s.TTL < now {
 		return true
 	}
-	
+
 	// Check idle TTL
 	if s.IdleTTL > 0 && s.LastAccess+s.IdleTTL < now {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -230,18 +254,18 @@ func (s *Session) GetExpireAt() int64 {
 	defer s.mu.RUnlock()
 
 	var expireAt int64 = 0
-	
+
 	if s.TTL > 0 {
 		expireAt = s.CreatedAt + s.TTL
 	}
-	
+
 	if s.IdleTTL > 0 {
 		idleExpire := s.LastAccess + s.IdleTTL
 		if expireAt == 0 || idleExpire < expireAt {
 			expireAt = idleExpire
 		}
 	}
-	
+
 	return expireAt
 }
 
@@ -251,7 +275,7 @@ func (s *Session) GetTTLRemaining() int64 {
 	if expireAt == 0 {
 		return -1 // no expiry
 	}
-	
+
 	remaining := expireAt - time.Now().UnixNano()
 	if remaining < 0 {
 		return 0
@@ -263,7 +287,7 @@ func (s *Session) GetTTLRemaining() int64 {
 func (s *Session) GetInfo() SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	return SessionInfo{
 		ID:         s.ID,
 		CreatedAt:  s.CreatedAt,

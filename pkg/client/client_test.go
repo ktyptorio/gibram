@@ -3,6 +3,8 @@ package client
 import (
 	"testing"
 	"time"
+
+	pb "github.com/gibram-io/gibram/proto/gibrampb"
 )
 
 // =============================================================================
@@ -146,6 +148,36 @@ func TestHealthStatus(t *testing.T) {
 	}
 	if len(hs.Components) != 2 {
 		t.Errorf("Components length = %d, want 2", len(hs.Components))
+	}
+}
+
+func TestServerInfoFromProtoMapsAllCurrentFields(t *testing.T) {
+	info := serverInfoFromProto(&pb.InfoResponse{
+		Version:           "test-version",
+		DocumentCount:     1,
+		TextunitCount:     2,
+		EntityCount:       3,
+		RelationshipCount: 4,
+		CommunityCount:    5,
+		VectorDim:         6,
+		SessionCount:      7,
+		SessionStoreMode:  "durable",
+		WalSyncPolicy:     "periodic",
+		WalSyncIntervalMs: 250,
+	})
+
+	if info.Version != "test-version" ||
+		info.DocumentCount != 1 ||
+		info.TextUnitCount != 2 ||
+		info.EntityCount != 3 ||
+		info.RelationshipCount != 4 ||
+		info.CommunityCount != 5 ||
+		info.VectorDim != 6 ||
+		info.SessionCount != 7 ||
+		info.SessionStoreMode != "durable" ||
+		info.WALSyncPolicy != "periodic" ||
+		info.WALSyncIntervalMS != 250 {
+		t.Fatalf("unexpected mapped server info: %+v", info)
 	}
 }
 
