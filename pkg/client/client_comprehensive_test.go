@@ -874,6 +874,10 @@ func TestClient_ConcurrentOperations(t *testing.T) {
 	const numOps = 20
 	errCh := make(chan error, numOps*3)
 
+	embedding := make([]float32, 64)
+	embedding[0] = 1
+	mustAddEntity(t, client, "ent-seed", "Entity Seed", "test", "Desc", embedding)
+
 	// Concurrent document additions
 	for i := 0; i < numOps; i++ {
 		wg.Add(1)
@@ -886,7 +890,6 @@ func TestClient_ConcurrentOperations(t *testing.T) {
 	}
 
 	// Concurrent entity additions
-	embedding := make([]float32, 64)
 	for i := 0; i < numOps; i++ {
 		wg.Add(1)
 		go func(id int) {
