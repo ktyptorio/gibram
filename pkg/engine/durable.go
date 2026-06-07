@@ -131,19 +131,12 @@ func openSessionWAL(walDir, policy string, interval time.Duration) (*sessionWAL,
 	if err != nil {
 		return nil, fmt.Errorf("open durable session WAL: %w", err)
 	}
-	info, err := file.Stat()
-	if err != nil {
-		if closeErr := file.Close(); closeErr != nil {
-			return nil, fmt.Errorf("stat durable session WAL: %v (close failed: %v)", err, closeErr)
-		}
-		return nil, fmt.Errorf("stat durable session WAL: %w", err)
-	}
 	generation, dataStart, err := readOrInitializeWALHeader(file)
 	if err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("read durable session WAL header: %w", err)
 	}
-	info, err = file.Stat()
+	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("stat initialized durable session WAL: %w", err)

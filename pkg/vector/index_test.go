@@ -495,10 +495,18 @@ func TestHNSWIndex_LargeK(t *testing.T) {
 func TestHNSWIndex_SearchQuality(t *testing.T) {
 	config := DefaultHNSWConfig()
 	config.EfSearch = 200 // Higher for better quality
-	idx := NewHNSWIndex(32, config)
+	idx := newHNSWIndexWithRand(32, config, rand.New(rand.NewSource(1)))
+	dataRand := rand.New(rand.NewSource(2))
+	randomQualityVector := func(dim int) []float32 {
+		vec := make([]float32, dim)
+		for i := range vec {
+			vec[i] = dataRand.Float32()*2 - 1
+		}
+		return vec
+	}
 
 	// Create a target vector
-	target := normalizeVector(randomVector(32))
+	target := normalizeVector(randomQualityVector(32))
 
 	// Create vectors at various distances from target
 	mustAdd(t, idx, 1, target) // Exact match
@@ -506,17 +514,15 @@ func TestHNSWIndex_SearchQuality(t *testing.T) {
 	// Near vectors (small perturbations)
 	for i := 2; i <= 10; i++ {
 		nearVec := make([]float32, 32)
-		testRandMu.Lock()
 		for j := range nearVec {
-			nearVec[j] = target[j] + (testRand.Float32()-0.5)*0.1
+			nearVec[j] = target[j] + (dataRand.Float32()-0.5)*0.1
 		}
-		testRandMu.Unlock()
 		mustAdd(t, idx, uint64(i), normalizeVector(nearVec))
 	}
 
 	// Far vectors (random)
 	for i := 11; i <= 50; i++ {
-		mustAdd(t, idx, uint64(i), normalizeVector(randomVector(32)))
+		mustAdd(t, idx, uint64(i), normalizeVector(randomQualityVector(32)))
 	}
 
 	// Search for target

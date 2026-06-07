@@ -73,15 +73,24 @@ type HNSWIndex struct {
 	nodes     map[uint64]*hnswNode
 	entryID   uint64
 	maxLevel  int
+	levelRand *rand.Rand
 }
 
 func NewHNSWIndex(dimension int, config HNSWConfig) *HNSWIndex {
+	return newHNSWIndexWithRand(dimension, config, rand.New(rand.NewSource(rand.Int63())))
+}
+
+func newHNSWIndexWithRand(dimension int, config HNSWConfig, levelRand *rand.Rand) *HNSWIndex {
+	if levelRand == nil {
+		levelRand = rand.New(rand.NewSource(rand.Int63()))
+	}
 	return &HNSWIndex{
 		config:    config,
 		dimension: dimension,
 		nodes:     make(map[uint64]*hnswNode),
 		entryID:   0,
 		maxLevel:  -1,
+		levelRand: levelRand,
 	}
 }
 
@@ -98,7 +107,7 @@ func (h *HNSWIndex) Count() int {
 // randomLevel generates a random level for a new node
 func (h *HNSWIndex) randomLevel() int {
 	level := 0
-	for rand.Float64() < h.config.ML && level < h.config.MaxLevel {
+	for h.levelRand.Float64() < h.config.ML && level < h.config.MaxLevel {
 		level++
 	}
 	return level
